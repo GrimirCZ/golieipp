@@ -1,0 +1,39 @@
+[Unit]
+Description=golieipp IPP policy proxy
+Documentation=https://github.com/grimir/golieipp
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/golieipp/golieipp -config /opt/golieipp/config.yaml
+WorkingDirectory=/opt/golieipp
+Restart=on-failure
+RestartSec=5s
+
+User=golieipp
+Group=golieipp
+UMask=0077
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/golieipp
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+
+[Install]
+WantedBy=multi-user.target

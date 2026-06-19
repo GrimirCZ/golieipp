@@ -1,0 +1,14 @@
+services:
+  golieipp:
+    build: .
+    image: golieipp:local
+    container_name: golieipp
+    restart: unless-stopped
+    ports:
+      - "8631:8631"
+    volumes:
+      - ./config.yaml:/opt/golieipp/config.yaml:ro
+      - golieipp-data:/data
+
+volumes:
+  golieipp-data:

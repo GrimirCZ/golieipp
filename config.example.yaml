@@ -1,0 +1,39 @@
+listen:
+  addr: ":8631"
+  public_base_url: "ipp://print-proxy.example.cz:8631/printers"
+storage:
+  sqlite_path: "jobs.db"
+printers:
+  office-a4-bw:
+    upstream_uri: "ipp://192.168.10.50/ipp/print"
+    display_name: "Office A4 B&W"
+    location: "Office"
+    refresh_interval: "5m"
+    policy:
+      media: "iso_a4_210x297mm"
+      media_type: "stationery"
+      print_color_mode: "monochrome"
+      media_source: null
+      print_scaling: "fit"
+      use_media_col: false
+    passthrough:
+      allow_unknown_attributes: true
+      preserve_job_attrs:
+        - copies
+        - sides
+        - finishings
+        - print-quality
+        - orientation-requested
+        - page-ranges
+        - number-up
+        - printer-resolution
+        - print-scaling
+      drop_vendor_attrs:
+        - ColorModel
+        - ColorMode
+        - InputSlot
+        - PageSize
+        - MediaType
+        - HPPaperSource
+        - BRMediaType
+        - RIPaperPolicy

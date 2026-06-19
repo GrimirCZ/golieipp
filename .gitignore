@@ -1,0 +1,23 @@
+# Build outputs
+/dist/
+/bin/
+*.exe
+*.test
+*.out
+
+# Local runtime state
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.log
+
+# Local configuration
+config.yaml
+.env
+.env.*
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/
