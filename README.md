@@ -127,6 +127,7 @@ ipptool -tv "$UPSTREAM_URI" /tmp/golieipp-probe.test
 Use the output to fill:
 
 - `printers.<queue>.upstream_uri`: the `UPSTREAM_URI` used for the probe.
+- `printers.<queue>.optional`: set to `true` to let the proxy start while this printer is offline. Optional printers are probed in the background immediately after startup and then at `refresh_interval`; the queue returns `printer-is-deactivated` until the first successful probe.
 - `printers.<queue>.location`: optional override for the advertised `printer-location`; use `""` or omit it to advertise an empty location.
 - `policy.media`: choose a value advertised in `media-supported`, for example `iso_a4_210x297mm`.
 - `policy.print_color_mode`: choose a value advertised in `print-color-mode-supported`, usually `monochrome` for this proxy's default policy.

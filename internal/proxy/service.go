@@ -107,6 +107,9 @@ func (w *loggingResponseWriter) Write(data []byte) (int, error) {
 
 func (s *Service) RefreshAll(ctx context.Context) error {
 	for queue, printer := range s.cfg.Printers {
+		if printer.Optional {
+			continue
+		}
 		if err := s.refreshOne(ctx, queue, printer); err != nil {
 			return fmt.Errorf("%s: %w", queue, err)
 		}
@@ -131,14 +134,15 @@ func (s *Service) StartRefreshLoop(ctx context.Context) {
 		ticker := time.NewTicker(interval)
 		timers = append(timers, ticker)
 		go func() {
+			if !s.printerAvailable(q) {
+				s.refreshInBackground(ctx, q, p)
+			}
 			for {
 				select {
 				case <-ctx.Done():
 					return
 				case <-ticker.C:
-					if err := s.refreshOne(ctx, q, p); err != nil {
-						s.logger.Warn("refresh upstream capabilities failed", "queue", q, "error", err)
-					}
+					s.refreshInBackground(ctx, q, p)
 				}
 			}
 		}()
@@ -148,12 +152,36 @@ func (s *Service) StartRefreshLoop(ctx context.Context) {
 
 func (s *Service) LogPrinterURLs() {
 	for queue, printer := range s.cfg.Printers {
-		s.logger.Info("printer available",
-			"queue", queue,
-			"display_name", printer.DisplayName,
-			"printer_url", s.proxyPrinterURI(queue),
-		)
+		if s.printerAvailable(queue) {
+			s.logPrinterAvailable(queue, printer)
+		}
 	}
+}
+
+func (s *Service) refreshInBackground(ctx context.Context, queue string, printer config.PrinterConfig) {
+	wasAvailable := s.printerAvailable(queue)
+	if err := s.refreshOne(ctx, queue, printer); err != nil {
+		s.logger.Warn("refresh upstream capabilities failed", "queue", queue, "error", err)
+		return
+	}
+	if !wasAvailable {
+		s.logPrinterAvailable(queue, printer)
+	}
+}
+
+func (s *Service) printerAvailable(queue string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	_, ok := s.capabilities[queue]
+	return ok
+}
+
+func (s *Service) logPrinterAvailable(queue string, printer config.PrinterConfig) {
+	s.logger.Info("printer available",
+		"queue", queue,
+		"display_name", printer.DisplayName,
+		"printer_url", s.proxyPrinterURI(queue),
+	)
 }
 
 func (s *Service) refreshOne(ctx context.Context, queue string, printer config.PrinterConfig) error {

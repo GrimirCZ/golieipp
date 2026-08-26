@@ -28,6 +28,7 @@ type PrinterConfig struct {
 	UpstreamURI     string            `yaml:"upstream_uri"`
 	DisplayName     string            `yaml:"display_name"`
 	Location        string            `yaml:"location"`
+	Optional        bool              `yaml:"optional"`
 	RefreshInterval time.Duration     `yaml:"-"`
 	RefreshRaw      string            `yaml:"refresh_interval"`
 	Policy          PolicyConfig      `yaml:"policy"`

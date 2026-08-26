@@ -5,4 +5,4 @@
 - Preserve document payload bytes; enforce policy by rewriting IPP job-template attributes.
 - SQLite is used from the start for proxy-to-upstream job ID mapping.
 - Prefer streaming with `io.MultiReader` when forwarding payload-carrying IPP operations.
-
+- Printers configured with `optional: true` skip the blocking startup probe, retry in the background, and return `printer-is-deactivated` until capabilities are fetched successfully.

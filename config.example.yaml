@@ -8,6 +8,7 @@ printers:
     upstream_uri: "ipp://192.168.10.50/ipp/print"
     display_name: "Office A4 B&W"
     location: "Office"
+    optional: false
     refresh_interval: "5m"
     policy:
       media: "iso_a4_210x297mm"
