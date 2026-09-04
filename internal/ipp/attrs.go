@@ -8,9 +8,6 @@ import (
 	"github.com/OpenPrinting/goipp"
 )
 
-const A4XDimension = 21000
-const A4YDimension = 29700
-
 func Attr(attrs goipp.Attributes, name string) (goipp.Attribute, bool) {
 	for _, attr := range attrs {
 		if strings.EqualFold(attr.Name, name) {
@@ -126,23 +123,6 @@ func Boolean(name string, value bool) goipp.Attribute {
 
 func Integer(name string, value int) goipp.Attribute {
 	return goipp.MakeAttribute(name, goipp.TagInteger, goipp.Integer(value))
-}
-
-func A4MediaCol(mediaType string) goipp.Attribute {
-	mediaSize := goipp.MakeAttrCollection("media-size",
-		goipp.MakeAttribute("x-dimension", goipp.TagInteger, goipp.Integer(A4XDimension)),
-		goipp.MakeAttribute("y-dimension", goipp.TagInteger, goipp.Integer(A4YDimension)),
-	)
-	if mediaType == "" {
-		return goipp.MakeAttrCollection("media-col", mediaSize)
-	}
-	return goipp.MakeAttrCollection("media-col", mediaSize, Keyword("media-type", mediaType))
-}
-
-func A4MediaColNamed(name, mediaType string) goipp.Attribute {
-	attr := A4MediaCol(mediaType)
-	attr.Name = name
-	return attr
 }
 
 func RewriteRequestPrinterURI(msg *goipp.Message, printerURI string) {

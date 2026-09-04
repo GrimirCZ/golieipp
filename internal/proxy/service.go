@@ -22,11 +22,13 @@ import (
 )
 
 type Service struct {
-	cfg      *config.Config
-	store    *store.Store
-	upstream *UpstreamClient
-	logger   *slog.Logger
-	nextID   atomic.Uint64
+	cfg             *config.Config
+	store           *store.Store
+	upstream        *UpstreamClient
+	logger          *slog.Logger
+	nextID          atomic.Uint64
+	startedAt       time.Time
+	configChangedAt time.Time
 
 	mu           sync.RWMutex
 	capabilities map[string]goipp.Attributes
@@ -38,12 +40,15 @@ func NewService(cfg *config.Config, jobStore *store.Store, logger *slog.Logger) 
 	if logger == nil {
 		logger = slog.Default()
 	}
+	startedAt := time.Now()
 	return &Service{
-		cfg:          cfg,
-		store:        jobStore,
-		upstream:     NewUpstreamClient(logger),
-		logger:       logger,
-		capabilities: map[string]goipp.Attributes{},
+		cfg:             cfg,
+		store:           jobStore,
+		upstream:        NewUpstreamClient(logger),
+		logger:          logger,
+		startedAt:       startedAt,
+		configChangedAt: startedAt,
+		capabilities:    map[string]goipp.Attributes{},
 	}, nil
 }
 
@@ -176,6 +181,15 @@ func (s *Service) printerAvailable(queue string) bool {
 	return ok
 }
 
+func (s *Service) upstreamCapabilities(queue string) goipp.Attributes {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if attrs, ok := s.capabilities[queue]; ok {
+		return attrs.DeepCopy()
+	}
+	return nil
+}
+
 func (s *Service) logPrinterAvailable(queue string, printer config.PrinterConfig) {
 	s.logger.Info("printer available",
 		"queue", queue,
@@ -276,7 +290,25 @@ func (s *Service) ippHandler(w http.ResponseWriter, r *http.Request) {
 		s.writeIPPError(w, goipp.DefaultVersion, 1, goipp.StatusErrorBadRequest, err.Error())
 		return
 	}
+	// RFC 8011 section 4.1.1 reserves request-id 0 for invalid requests. Do
+	// this check before dispatching so a malformed request cannot reach an
+	// upstream printer and, in particular, never return printer attributes.
+	if req.RequestID == 0 {
+		logger.Warn("ipp request rejected", "reason", "zero_request_id")
+		s.writeIPPError(w, req.Version, req.RequestID, goipp.StatusErrorBadRequest, "request-id must be non-zero")
+		return
+	}
 	op := goipp.Op(req.Code)
+	if !supportedIPPVersion(req.Version) {
+		logger.Warn("ipp request rejected", "reason", "unsupported_ipp_version", "ipp_version", req.Version.String())
+		s.writeIPPError(w, req.Version, req.RequestID, goipp.StatusErrorVersionNotSupported, "IPP version not supported")
+		return
+	}
+	if err := validateRequiredOperationAttrs(req.Operation, op); err != nil {
+		logger.Warn("ipp request rejected", "reason", "invalid_operation_attributes", "error", err)
+		s.writeIPPError(w, req.Version, req.RequestID, goipp.StatusErrorBadRequest, err.Error())
+		return
+	}
 	logger = logger.With(
 		"ipp_version", req.Version.String(),
 		"ipp_request_id", req.RequestID,
@@ -301,7 +333,7 @@ func (s *Service) ippHandler(w http.ResponseWriter, r *http.Request) {
 		resp, err = s.handleSendDocument(r.Context(), queue, printer, req, br)
 	case goipp.OpGetJobAttributes, goipp.OpCancelJob, goipp.OpCloseJob:
 		resp, err = s.handleMappedJobOperation(r.Context(), queue, printer, req)
-	case goipp.OpGetJobs:
+	case goipp.OpGetJobs, goipp.OpCancelMyJobs, goipp.OpIdentifyPrinter:
 		resp, err = s.forwardPrinterOperation(r.Context(), printer, req)
 	default:
 		resp = goipp.NewResponse(req.Version, goipp.StatusErrorOperationNotSupported, req.RequestID)
@@ -326,6 +358,48 @@ func (s *Service) ippHandler(w http.ResponseWriter, r *http.Request) {
 	writeIPP(w, resp)
 }
 
+func supportedIPPVersion(version goipp.Version) bool {
+	switch version {
+	case goipp.MakeVersion(1, 0), goipp.MakeVersion(1, 1), goipp.MakeVersion(2, 0):
+		return true
+	default:
+		return false
+	}
+}
+
+func validateRequiredOperationAttrs(attrs goipp.Attributes, op goipp.Op) error {
+	if len(attrs) < 2 || !singleValueAttr(attrs[0], "attributes-charset", goipp.TagCharset) ||
+		!singleValueAttr(attrs[1], "attributes-natural-language", goipp.TagLanguage) {
+		return errors.New("attributes-charset and attributes-natural-language must be the first two operation attributes")
+	}
+	if printerOperationRequiresURI(op) {
+		attr, ok := iattr.Attr(attrs, "printer-uri")
+		if !ok || len(attr.Values) != 1 || attr.Values[0].T != goipp.TagURI {
+			return errors.New("printer-uri operation attribute is required")
+		}
+	}
+	return nil
+}
+
+func singleValueAttr(attr goipp.Attribute, name string, tag goipp.Tag) bool {
+	return strings.EqualFold(attr.Name, name) && len(attr.Values) == 1 && attr.Values[0].T == tag
+}
+
+func printerOperationRequiresURI(op goipp.Op) bool {
+	switch op {
+	case goipp.OpPrintJob,
+		goipp.OpValidateJob,
+		goipp.OpCreateJob,
+		goipp.OpGetJobs,
+		goipp.OpGetPrinterAttributes,
+		goipp.OpCancelMyJobs,
+		goipp.OpIdentifyPrinter:
+		return true
+	default:
+		return false
+	}
+}
+
 func (s *Service) handleGetPrinterAttributes(_ context.Context, queue string, printer config.PrinterConfig, req *goipp.Message) (*goipp.Message, error) {
 	s.mu.RLock()
 	upstream, ok := s.capabilities[queue]
@@ -335,12 +409,12 @@ func (s *Service) handleGetPrinterAttributes(_ context.Context, queue string, pr
 	}
 	resp := goipp.NewResponse(req.Version, goipp.StatusOk, req.RequestID)
 	resp.Operation = responseOperationAttrs("")
-	resp.Printer = FilterPrinterAttributes(upstream.DeepCopy(), queue, s.proxyPrinterURI(queue), printer)
+	resp.Printer = FilterPrinterAttributes(upstream.DeepCopy(), queue, s.proxyPrinterURI(queue), printer, s.proxyPrinterIdentity(queue))
 	return resp, nil
 }
 
-func (s *Service) handleValidateJob(ctx context.Context, _ string, printer config.PrinterConfig, req *goipp.Message) (*goipp.Message, error) {
-	normalized, _ := NormalizeJobAttrs(req.Job, printer.Policy, printer.Passthrough.DropVendorAttrs)
+func (s *Service) handleValidateJob(ctx context.Context, queue string, printer config.PrinterConfig, req *goipp.Message) (*goipp.Message, error) {
+	normalized, _ := NormalizeJobAttrsWithCapabilities(req.Job, printer.Policy, printer.Passthrough.DropVendorAttrs, s.upstreamCapabilities(queue))
 	req.Operation = rewriteOperationForUpstream(req.Operation, printer.UpstreamURI)
 	req.Job = normalized
 	req.Groups = nil
@@ -348,7 +422,7 @@ func (s *Service) handleValidateJob(ctx context.Context, _ string, printer confi
 }
 
 func (s *Service) handlePrintJob(ctx context.Context, queue string, printer config.PrinterConfig, req *goipp.Message, payload *bufio.Reader) (*goipp.Message, error) {
-	normalized, normLog := NormalizeJobAttrs(req.Job, printer.Policy, printer.Passthrough.DropVendorAttrs)
+	normalized, normLog := NormalizeJobAttrsWithCapabilities(req.Job, printer.Policy, printer.Passthrough.DropVendorAttrs, s.upstreamCapabilities(queue))
 	user, _ := iattr.FirstString(req.Operation, "requesting-user-name")
 	jobName, _ := iattr.FirstString(req.Operation, "job-name")
 	format, _ := iattr.FirstString(req.Operation, "document-format")
@@ -423,7 +497,7 @@ func (s *Service) handlePrintJob(ctx context.Context, queue string, printer conf
 }
 
 func (s *Service) handleCreateJob(ctx context.Context, queue string, printer config.PrinterConfig, req *goipp.Message) (*goipp.Message, error) {
-	normalized, normLog := NormalizeJobAttrs(req.Job, printer.Policy, printer.Passthrough.DropVendorAttrs)
+	normalized, normLog := NormalizeJobAttrsWithCapabilities(req.Job, printer.Policy, printer.Passthrough.DropVendorAttrs, s.upstreamCapabilities(queue))
 	user, _ := iattr.FirstString(req.Operation, "requesting-user-name")
 	jobName, _ := iattr.FirstString(req.Operation, "job-name")
 	format, _ := iattr.FirstString(req.Operation, "document-format")
@@ -510,6 +584,15 @@ func (s *Service) handleSendDocument(ctx context.Context, queue string, printer 
 		return nil, err
 	}
 	if !ippSuccess(resp) {
+		if proxyJobID > 0 {
+			if stateErr := s.store.UpdateState(ctx, queue, proxyJobID, "failed"); stateErr != nil {
+				s.logger.Warn("record rejected document state failed",
+					"queue", queue,
+					"proxy_job_id", proxyJobID,
+					"error", stateErr,
+				)
+			}
+		}
 		s.logger.Warn("send document rejected by upstream",
 			"queue", queue,
 			"proxy_job_id", proxyJobID,
@@ -523,6 +606,9 @@ func (s *Service) handleSendDocument(ctx context.Context, queue string, printer 
 	}
 	if proxyJobID > 0 {
 		if err := s.store.UpdatePayloadMetadata(ctx, queue, proxyJobID, format, meta.Bytes, meta.PageCount, meta.Copies, meta.EstimatedImpressions); err != nil {
+			return nil, err
+		}
+		if err := s.store.UpdateState(ctx, queue, proxyJobID, "submitted"); err != nil {
 			return nil, err
 		}
 		s.logger.Info("job document submitted",
@@ -672,9 +758,10 @@ func rewriteOperationForUpstream(attrs goipp.Attributes, upstreamURI string) goi
 
 func rewriteMappedJobOperation(attrs goipp.Attributes, job store.Job) goipp.Attributes {
 	attrs = iattr.SetAttr(attrs, iattr.Integer("job-id", job.UpstreamJobID))
-	if job.UpstreamJobURI != "" {
-		return iattr.SetAttr(attrs, iattr.URI("job-uri", job.UpstreamJobURI))
-	}
+	// RFC 8011 identifies a Job using either job-uri or printer-uri plus
+	// job-id. The configured printer-uri is added by
+	// rewriteOperationForUpstream, so remove job-uri to avoid sending both
+	// target forms. Some printers reject that ambiguous combination.
 	return iattr.DropAttrs(attrs, "job-uri")
 }
 

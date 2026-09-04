@@ -18,6 +18,23 @@ go run ./cmd/golieipp -config config.yaml -debug
 
 Debug logs are structured JSON and include request correlation IDs, IPP operation/request IDs, upstream HTTP status, upstream IPP status, and timing. Document payload bytes are not logged.
 
+Dump the raw capabilities of every configured upstream printer without starting
+the proxy or opening its SQLite job store:
+
+```sh
+go run ./cmd/golieipp -config config.yaml -dump-printer-capabilities > capabilities.json
+```
+
+The command probes optional printers too and emits one JSON object per queue.
+The `attributes` array contains the decoded upstream printer attributes before
+policy filtering, including media sizes that are not in the configured policy.
+Probe errors are kept on their queue entry and cause a non-zero exit status.
+
+Each proxy queue has its own stable printer identity derived from its public
+printer URI, so clients do not reuse the upstream printer's capability cache.
+Configuration is loaded at startup; after changing a queue's policy, restart
+the proxy so clients receive new proxy-owned configuration-change metadata.
+
 Start from `config.example.yaml`.
 
 ## Install with systemd
@@ -129,10 +146,12 @@ Use the output to fill:
 - `printers.<queue>.upstream_uri`: the `UPSTREAM_URI` used for the probe.
 - `printers.<queue>.optional`: set to `true` to let the proxy start while this printer is offline. Optional printers are probed in the background immediately after startup and then at `refresh_interval`; the queue returns `printer-is-deactivated` until the first successful probe.
 - `printers.<queue>.location`: optional override for the advertised `printer-location`; use `""` or omit it to advertise an empty location.
-- `policy.media`: choose a value advertised in `media-supported`, for example `iso_a4_210x297mm`.
+- `policy.media_supported`: choose one or more values advertised in `media-supported`, for example `iso_a4_210x297mm` and `na_letter_8.5x11in`.
+- `policy.media_default`: choose the value used when a client omits media or requests an unsupported/malformed media value. It must be one of `media_supported`.
+- `policy.media`: legacy single-size configuration; it is promoted to a one-item `media_supported` list and its default. Do not combine it with the new fields.
 - `policy.print_color_mode`: choose a value advertised in `print-color-mode-supported`, usually `monochrome` for this proxy's default policy.
 - `policy.media_type`: choose a value from `media-type-supported`, if the printer advertises it; otherwise the default `stationery` is used.
-- `policy.media_source`: choose a value from `media-source-supported` when you need to force a tray, otherwise leave it `null`.
+- `policy.media_source`: choose a value from `media-source-supported` when you need to force a tray, otherwise leave it `null` to advertise automatic (`auto`) media-source selection.
 
 ## Implemented IPP operations
 
@@ -144,4 +163,6 @@ Use the output to fill:
 - `Close-Job`
 - `Get-Job-Attributes`
 - `Get-Jobs`
+- `Cancel-My-Jobs`
+- `Identify-Printer`
 - `Cancel-Job`

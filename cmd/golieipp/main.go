@@ -18,13 +18,19 @@ import (
 func main() {
 	configPath := flag.String("config", "config.yaml", "path to YAML configuration")
 	debug := flag.Bool("debug", false, "enable debug logging")
+	dumpCapabilities := flag.Bool("dump-printer-capabilities", false, "probe every configured printer and emit raw capabilities as JSON")
 	flag.Parse()
 
 	level := slog.LevelInfo
 	if *debug {
 		level = slog.LevelDebug
 	}
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
+	logOutput := os.Stdout
+	if *dumpCapabilities {
+		// stdout is reserved for the machine-readable report in dump mode.
+		logOutput = os.Stderr
+	}
+	logger := slog.New(slog.NewJSONHandler(logOutput, &slog.HandlerOptions{Level: level}))
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		logger.Error("load config", "error", err)
@@ -36,6 +42,13 @@ func main() {
 		"public_base_url", cfg.Listen.PublicBaseURL,
 		"printer_count", len(cfg.Printers),
 	)
+	if *dumpCapabilities {
+		if err := proxy.DumpPrinterCapabilities(context.Background(), cfg, os.Stdout); err != nil {
+			logger.Error("dump printer capabilities failed", "error", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	jobStore, err := store.Open(cfg.Storage.SQLitePath)
 	if err != nil {

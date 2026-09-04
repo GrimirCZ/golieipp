@@ -11,7 +11,11 @@ printers:
     optional: false
     refresh_interval: "5m"
     policy:
-      media: "iso_a4_210x297mm"
+      # Every value must be advertised by the upstream printer. Add more
+      # values here to allow clients to choose among them.
+      media_supported:
+        - "iso_a4_210x297mm"
+      media_default: "iso_a4_210x297mm"
       media_type: "stationery"
       print_color_mode: "monochrome"
       media_source: null
