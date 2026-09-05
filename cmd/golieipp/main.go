@@ -31,7 +31,7 @@ func main() {
 		logOutput = os.Stderr
 	}
 	logger := slog.New(slog.NewJSONHandler(logOutput, &slog.HandlerOptions{Level: level}))
-	cfg, err := config.Load(*configPath)
+	cfg, err := config.LoadWithLogger(*configPath, logger)
 	if err != nil {
 		logger.Error("load config", "error", err)
 		os.Exit(1)
@@ -62,6 +62,11 @@ func main() {
 		logger.Error("create service", "error", err)
 		os.Exit(1)
 	}
+	defer func() {
+		if err := svc.Close(); err != nil {
+			logger.Warn("close service", "error", err)
+		}
+	}()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -72,6 +77,7 @@ func main() {
 	}
 	svc.LogPrinterURLs()
 	go svc.StartRefreshLoop(ctx)
+	go svc.StartMaintenanceLoop(ctx)
 
 	server := &http.Server{
 		Addr:              cfg.Listen.Addr,

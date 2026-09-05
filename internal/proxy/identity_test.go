@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -115,7 +116,6 @@ func TestFilterPrinterAttributesPreventsMacOSUpstreamCapabilityCacheReuse(t *tes
 	}
 	metadata := PrinterIdentityMetadata{
 		UUID:                 proxyPrinterUUID(proxyURI),
-		Uptime:               10,
 		ConfigChangeDateTime: time.Date(2026, time.September, 4, 9, 39, 20, 0, time.UTC),
 	}
 	first := FilterPrinterAttributes(upstream, "dilny", proxyURI, printer, metadata)
@@ -133,8 +133,10 @@ func TestFilterPrinterAttributesPreventsMacOSUpstreamCapabilityCacheReuse(t *tes
 	}
 	firstChange, _ := iattr.FirstInt(first, "printer-config-change-time")
 	secondChange, _ := iattr.FirstInt(second, "printer-config-change-time")
-	if firstChange != 0 || secondChange != 0 {
-		t.Fatalf("upstream config-change time leaked: %d %d", firstChange, secondChange)
+	firstUptime, _ := iattr.FirstInt(first, "printer-up-time")
+	secondUptime, _ := iattr.FirstInt(second, "printer-up-time")
+	if firstUptime < 1 || secondUptime < 1 || firstChange < 1 || secondChange < 1 {
+		t.Fatalf("partially supplied identity emitted an invalid clock: uptime=%d/%d change=%d/%d", firstUptime, secondUptime, firstChange, secondChange)
 	}
 }
 
@@ -203,5 +205,132 @@ func TestServicePrinterIdentityIsStableAndUptimeNondecreasing(t *testing.T) {
 	}
 	if firstDate.Values[0].V != secondDate.Values[0].V {
 		t.Fatal("proxy config-change-date-time changed between queries")
+	}
+}
+
+func TestServicePrinterConfigEpochIsQueueScopedAndIgnoresVolatileRefresh(t *testing.T) {
+	upstreamAttrs := goipp.Attributes{
+		iattr.Keyword("media-supported", "iso_a4_210x297mm"),
+		iattr.Integer("printer-up-time", 10),
+		goipp.MakeAttribute("printer-current-time", goipp.TagDateTime, goipp.Time{Time: time.Date(2026, time.September, 5, 12, 0, 0, 0, time.UTC)}),
+		iattr.Integer("printer-config-change-time", 7),
+		goipp.MakeAttribute("printer-config-change-date-time", goipp.TagDateTime, goipp.Time{Time: time.Date(2026, time.September, 5, 11, 0, 0, 0, time.UTC)}),
+		goipp.MakeAttribute("printer-state", goipp.TagEnum, goipp.Integer(3)),
+		iattr.Keyword("printer-state-reasons", "none"),
+		iattr.Boolean("printer-is-accepting-jobs", true),
+		iattr.Integer("queued-job-count", 0),
+		iattr.Keyword("media-ready", "iso_a4_210x297mm"),
+	}
+	upstream := newIPv4TestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		request := &goipp.Message{}
+		if err := request.Decode(r.Body); err != nil {
+			t.Errorf("decode upstream request: %v", err)
+			return
+		}
+		response := goipp.NewResponse(request.Version, goipp.StatusOk, request.RequestID)
+		response.Operation = responseOperationAttrs("")
+		response.Printer = upstreamAttrs.DeepCopy()
+		writeIPP(w, response)
+	}))
+	defer upstream.Close()
+
+	jobStore, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer jobStore.Close()
+
+	upstreamURI := strings.Replace(upstream.URL, "http://", "ipp://", 1)
+	printer := config.PrinterConfig{
+		UpstreamURI: upstreamURI,
+		DisplayName: "Office",
+		Policy: config.PolicyConfig{
+			Media:          "iso_a4_210x297mm",
+			MediaType:      "stationery",
+			PrintColorMode: "monochrome",
+		},
+	}
+	cfg := &config.Config{
+		Listen: config.ListenConfig{PublicBaseURL: "ipp://proxy/printers"},
+		Printers: map[string]config.PrinterConfig{
+			"office": printer,
+			"home":   {UpstreamURI: upstreamURI, DisplayName: "Home", Policy: printer.Policy},
+		},
+	}
+	svc, err := NewService(cfg, jobStore, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Keep the second queue client-visible without refreshing it. A global
+	// epoch would incorrectly advance this queue when office refreshes.
+	svc.mu.Lock()
+	svc.capabilities["home"] = goipp.Attributes{iattr.Keyword("media-supported", "iso_a4_210x297mm")}
+	svc.mu.Unlock()
+
+	identityDate := func(queue string) time.Time {
+		t.Helper()
+		request := goipp.NewRequest(goipp.DefaultVersion, goipp.OpGetPrinterAttributes, 1)
+		response, err := svc.handleGetPrinterAttributes(context.Background(), queue, cfg.Printers[queue], request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		attr, ok := iattr.Attr(response.Printer, "printer-config-change-date-time")
+		if !ok || len(attr.Values) != 1 {
+			t.Fatalf("queue %s omitted config-change-date-time: %#v", queue, response.Printer)
+		}
+		value, ok := attr.Values[0].V.(goipp.Time)
+		if !ok {
+			t.Fatalf("queue %s returned malformed config-change-date-time: %#v", queue, attr.Values[0])
+		}
+		return value.Time
+	}
+
+	homeBefore := identityDate("home")
+	if err := svc.refreshOne(context.Background(), "office", printer); err != nil {
+		t.Fatal(err)
+	}
+	officeAfterInitial := identityDate("office")
+	homeAfterInitial := identityDate("home")
+	if officeAfterInitial.Equal(homeBefore) {
+		t.Fatal("office refresh did not establish its own configuration epoch")
+	}
+	if !homeAfterInitial.Equal(homeBefore) {
+		t.Fatal("refreshing office changed home configuration epoch")
+	}
+
+	// Status, uptime, and readiness are volatile observations and must not
+	// invalidate the client capability/configuration epoch.
+	upstreamAttrs = iattr.SetAttr(upstreamAttrs, iattr.Integer("printer-up-time", 99))
+	upstreamAttrs = iattr.SetAttr(upstreamAttrs, goipp.MakeAttribute("printer-current-time", goipp.TagDateTime, goipp.Time{Time: time.Date(2026, time.September, 5, 12, 1, 0, 0, time.UTC)}))
+	upstreamAttrs = iattr.SetAttr(upstreamAttrs, iattr.Integer("printer-config-change-time", 99))
+	upstreamAttrs = iattr.SetAttr(upstreamAttrs, goipp.MakeAttribute("printer-config-change-date-time", goipp.TagDateTime, goipp.Time{Time: time.Date(2026, time.September, 5, 12, 1, 0, 0, time.UTC)}))
+	upstreamAttrs = iattr.SetAttr(upstreamAttrs, goipp.MakeAttribute("printer-state", goipp.TagEnum, goipp.Integer(5)))
+	upstreamAttrs = iattr.SetAttr(upstreamAttrs, iattr.Keyword("printer-state-reasons", "processing"))
+	upstreamAttrs = iattr.SetAttr(upstreamAttrs, iattr.Boolean("printer-is-accepting-jobs", false))
+	upstreamAttrs = iattr.SetAttr(upstreamAttrs, iattr.Integer("queued-job-count", 4))
+	upstreamAttrs = iattr.SetAttr(upstreamAttrs, iattr.Keyword("media-ready", ""))
+	if err := svc.refreshOne(context.Background(), "office", printer); err != nil {
+		t.Fatal(err)
+	}
+	officeAfterVolatile := identityDate("office")
+	if !officeAfterVolatile.Equal(officeAfterInitial) {
+		t.Fatal("volatile upstream status changed the office configuration epoch")
+	}
+	if !identityDate("home").Equal(homeBefore) {
+		t.Fatal("volatile office refresh changed home configuration epoch")
+	}
+
+	// A real capability change must advance office's epoch, while still not
+	// touching the independent home queue epoch.
+	upstreamAttrs = iattr.SetAttr(upstreamAttrs, iattr.Keywords("media-supported", "iso_a4_210x297mm", "na_letter_8.5x11in"))
+	if err := svc.refreshOne(context.Background(), "office", printer); err != nil {
+		t.Fatal(err)
+	}
+	officeAfterCapabilityChange := identityDate("office")
+	if officeAfterCapabilityChange.Equal(officeAfterVolatile) {
+		t.Fatal("real upstream capability change did not advance office epoch")
+	}
+	if !identityDate("home").Equal(homeBefore) {
+		t.Fatal("office capability change changed home configuration epoch")
 	}
 }

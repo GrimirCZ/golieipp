@@ -27,6 +27,8 @@ func proxyPrinterUUID(proxyURI string) string {
 func defaultPrinterIdentityMetadata(proxyURI string) PrinterIdentityMetadata {
 	return PrinterIdentityMetadata{
 		UUID:                 proxyPrinterUUID(proxyURI),
+		Uptime:               1,
+		ConfigChangeTime:     1,
 		ConfigChangeDateTime: time.Unix(0, 0).UTC(),
 	}
 }
@@ -34,6 +36,8 @@ func defaultPrinterIdentityMetadata(proxyURI string) PrinterIdentityMetadata {
 func (s *Service) proxyPrinterIdentity(queue string) PrinterIdentityMetadata {
 	proxyURI := s.proxyPrinterURI(queue)
 	identity := defaultPrinterIdentityMetadata(proxyURI)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
 	startedAt := s.startedAt
 	if startedAt.IsZero() {
@@ -42,18 +46,18 @@ func (s *Service) proxyPrinterIdentity(queue string) PrinterIdentityMetadata {
 		// effect on production instances.
 		startedAt = time.Unix(0, 0)
 	}
-	configChangedAt := s.configChangedAt
+	configChangedAt := s.configChangedAt[queue]
 	if configChangedAt.IsZero() {
 		configChangedAt = startedAt
 	}
 
 	uptime := int(time.Since(startedAt) / time.Second)
-	if uptime < 0 {
-		uptime = 0
+	if uptime < 1 {
+		uptime = 1
 	}
 	changeTime := int(configChangedAt.Sub(startedAt) / time.Second)
-	if changeTime < 0 {
-		changeTime = 0
+	if changeTime < 1 {
+		changeTime = 1
 	}
 	if changeTime > uptime {
 		changeTime = uptime

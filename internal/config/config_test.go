@@ -1,11 +1,14 @@
 package config
 
 import (
+	"bytes"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoadOptionalPrinter(t *testing.T) {
@@ -139,6 +142,206 @@ printers:
 	policy := cfg.Printers["office"].Policy
 	if policy.Media != "iso_a4_210x297mm" || policy.MediaDefault != policy.Media || len(policy.MediaSupported) != 1 {
 		t.Fatalf("unexpected implicit A4 policy: %+v", policy)
+	}
+}
+
+func TestLoadAppliesDNSDefaultsAndPreservesExplicitFalse(t *testing.T) {
+	cfg := loadConfigYAML(t, `
+listen:
+  public_base_url: "ipps://proxy.example/printers"
+printers:
+  default:
+    upstream_uri: "ipp://printer.example/ipp/print"
+  disabled:
+    upstream_uri: "ipps://secure-printer.example/ipp/print"
+    ipp_everywhere_mode: disabled
+    dns_sd: false
+    geo_location: "geo:50.0755,14.4378"
+`)
+	if cfg.DNSSD.Mode != DNSModeAuto {
+		t.Fatalf("expected DNS-SD mode %q, got %q", DNSModeAuto, cfg.DNSSD.Mode)
+	}
+	if got := cfg.Printers["default"].IPPEverywhereMode; got != IPPEverywhereAuto {
+		t.Fatalf("expected IPP Everywhere default %q, got %q", IPPEverywhereAuto, got)
+	}
+	if !cfg.Printers["default"].DNSSD {
+		t.Fatal("expected printer DNS-SD to default to enabled")
+	}
+	if cfg.Printers["disabled"].DNSSD {
+		t.Fatal("explicit dns_sd: false was not preserved")
+	}
+	if cfg.Printers["disabled"].GeoLocation != "geo:50.0755,14.4378" {
+		t.Fatalf("unexpected geo location %q", cfg.Printers["disabled"].GeoLocation)
+	}
+}
+
+func TestLoadWarnsOnUnknownAndDeprecatedYAMLKeys(t *testing.T) {
+	var log bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&log, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	data := []byte(`
+listen:
+  public_base_url: "ipp://proxy.example/printers"
+  future_listen_key: true
+printers:
+  office:
+    upstream_uri: "ipp://printer.example/ipp/print"
+    future_printer_key: true
+    passthrough:
+      allow_unknown_attributes: true
+      future_passthrough_key: true
+`)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadWithLogger(path, logger); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"listen.future_listen_key",
+		"printers.office.future_printer_key",
+		"printers.office.passthrough.future_passthrough_key",
+		"passthrough.allow_unknown_attributes",
+	} {
+		if !strings.Contains(log.String(), want) {
+			t.Errorf("warning log did not contain %q:\n%s", want, log.String())
+		}
+	}
+}
+
+func TestLoadAppliesGlobalResourceDefaults(t *testing.T) {
+	cfg := loadConfigYAML(t, `
+listen:
+  public_base_url: "ipp://proxy.example/printers"
+printers:
+  office:
+    upstream_uri: "ipp://printer.example/ipp/print"
+`)
+	if got, want := cfg.Defaults.MaxEnvelopeBytes, int64(1<<20); got != want {
+		t.Fatalf("envelope default = %d, want %d", got, want)
+	}
+	if got, want := cfg.Defaults.MaxDocumentBytes, int64(1<<30); got != want {
+		t.Fatalf("document default = %d, want %d", got, want)
+	}
+	if got, want := cfg.Defaults.MaxUpstreamResponseBytes, int64(32<<20); got != want {
+		t.Fatalf("upstream response default = %d, want %d", got, want)
+	}
+	if got, want := cfg.Defaults.MaxConcurrentPayloadJobsPerQueue, 2; got != want {
+		t.Fatalf("concurrency default = %d, want %d", got, want)
+	}
+	if got, want := cfg.Defaults.JobRetention, 30*24*time.Hour; got != want {
+		t.Fatalf("retention default = %s, want %s", got, want)
+	}
+}
+
+func TestLoadParsesGlobalResourceLimits(t *testing.T) {
+	cfg := loadConfigYAML(t, `
+listen:
+  public_base_url: "ipp://proxy.example/printers"
+defaults:
+  max_envelope_bytes: 2MiB
+  max_document_bytes: "3GiB"
+  max_upstream_response_bytes: 4MiB
+  max_concurrent_payload_jobs_per_queue: 7
+  job_retention: 48h
+printers:
+  office:
+    upstream_uri: "ipp://printer.example/ipp/print"
+`)
+	if got, want := cfg.Defaults.MaxEnvelopeBytes, int64(2<<20); got != want {
+		t.Fatalf("envelope = %d, want %d", got, want)
+	}
+	if got, want := cfg.Defaults.MaxDocumentBytes, int64(3<<30); got != want {
+		t.Fatalf("document = %d, want %d", got, want)
+	}
+	if got, want := cfg.Defaults.MaxUpstreamResponseBytes, int64(4<<20); got != want {
+		t.Fatalf("upstream response = %d, want %d", got, want)
+	}
+	if got, want := cfg.Defaults.MaxConcurrentPayloadJobsPerQueue, 7; got != want {
+		t.Fatalf("concurrency = %d, want %d", got, want)
+	}
+	if got, want := cfg.Defaults.JobRetention, 48*time.Hour; got != want {
+		t.Fatalf("retention = %s, want %s", got, want)
+	}
+	if cfg.Limits != cfg.Defaults {
+		t.Fatalf("limits alias was not synchronized: limits=%+v defaults=%+v", cfg.Limits, cfg.Defaults)
+	}
+}
+
+func TestLoadRejectsInvalidURIsEnumsKeywordsAndRanges(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want string
+	}{
+		{name: "public URI", body: `listen:
+  public_base_url: "http://proxy.example/printers"`, want: "listen.public_base_url"},
+		{name: "upstream URI", body: `listen:
+  public_base_url: "ipp://proxy.example/printers"
+printers:
+  office:
+    upstream_uri: "ipp://"`, want: "upstream_uri"},
+		{name: "IPP Everywhere mode", body: `listen:
+  public_base_url: "ipp://proxy.example/printers"
+printers:
+  office:
+    upstream_uri: "ipp://printer.example/ipp/print"
+    ipp_everywhere_mode: sometimes`, want: "ipp_everywhere_mode"},
+		{name: "keyword", body: `listen:
+  public_base_url: "ipp://proxy.example/printers"
+printers:
+  office:
+    upstream_uri: "ipp://printer.example/ipp/print"
+    policy:
+      media: "not a keyword"`, want: "media"},
+		{name: "refresh range", body: `listen:
+  public_base_url: "ipp://proxy.example/printers"
+printers:
+  office:
+    upstream_uri: "ipp://printer.example/ipp/print"
+    refresh_interval: "-1m"`, want: "refresh_interval"},
+		{name: "default range", body: `listen:
+  public_base_url: "ipp://proxy.example/printers"
+defaults:
+  max_document_bytes: 0
+printers:
+  office:
+    upstream_uri: "ipp://printer.example/ipp/print"`, want: "max_document_bytes"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := loadConfigYAMLError(t, test.body)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("expected error containing %q, got %v", test.want, err)
+			}
+		})
+	}
+}
+
+func TestLoadRejectsNonPositiveRetentionAndSupportsDayDurations(t *testing.T) {
+	cfg := loadConfigYAML(t, `
+listen:
+  public_base_url: "ipp://proxy.example/printers"
+defaults:
+  retention: 2d
+printers:
+  office:
+    upstream_uri: "ipp://printer.example/ipp/print"
+`)
+	if got, want := cfg.Defaults.JobRetention, 48*time.Hour; got != want {
+		t.Fatalf("retention = %s, want %s", got, want)
+	}
+	_, err := loadConfigYAMLError(t, `
+listen:
+  public_base_url: "ipp://proxy.example/printers"
+defaults:
+  retention: 0s
+printers:
+  office:
+    upstream_uri: "ipp://printer.example/ipp/print"
+`)
+	if err == nil || !strings.Contains(err.Error(), "retention") {
+		t.Fatalf("expected non-positive retention error, got %v", err)
 	}
 }
 

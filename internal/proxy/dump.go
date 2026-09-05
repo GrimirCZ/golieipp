@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/OpenPrinting/goipp"
 	"github.com/grimir/golieipp/internal/config"
@@ -36,9 +37,13 @@ type PrinterCapabilityDump struct {
 }
 
 type DumpAttribute struct {
-	Name   string `json:"name"`
-	Tag    string `json:"tag"`
-	Values []any  `json:"values"`
+	Name   string      `json:"name"`
+	Values []DumpValue `json:"values"`
+}
+
+type DumpValue struct {
+	Tag   string `json:"tag"`
+	Value any    `json:"value"`
 }
 
 // CapabilityDumpError indicates that the JSON report was emitted but one or
@@ -71,37 +76,53 @@ func DumpPrinterCapabilities(ctx context.Context, cfg *config.Config, output io.
 	}
 	sort.Strings(queues)
 
-	report := CapabilityDump{Printers: make([]PrinterCapabilityDump, 0, len(queues))}
-	failed := make([]string, 0)
-	for _, queue := range queues {
-		printer := cfg.Printers[queue]
-		item := PrinterCapabilityDump{
-			Queue:       queue,
-			UpstreamURI: redactDumpString(printer.UpstreamURI),
-			DisplayName: printer.DisplayName,
-			Location:    printer.Location,
-			Optional:    printer.Optional,
-		}
-		resp, err := client.GetPrinterAttributes(ctx, printer.UpstreamURI)
-		if err != nil {
-			item.Error = safeProbeError(err, printer.UpstreamURI)
-			failed = append(failed, queue)
-		} else if resp == nil {
-			item.Error = "upstream returned an empty IPP response"
-			failed = append(failed, queue)
-		} else {
-			item.StatusCode = int(resp.Code)
-			item.Status = goipp.Status(resp.Code).String()
-			item.Attributes = dumpAttributes(resp.Printer)
-			if goipp.Status(resp.Code) >= goipp.StatusErrorBadRequest {
-				item.Error = safeProbeError(errors.New(statusMessage(resp)), printer.UpstreamURI)
-				if item.Error == "" {
-					item.Error = item.Status
-				}
-				failed = append(failed, queue)
+	report := CapabilityDump{Printers: make([]PrinterCapabilityDump, len(queues))}
+	failedByIndex := make([]bool, len(queues))
+	semaphore := make(chan struct{}, 4)
+	var wg sync.WaitGroup
+	for index, queue := range queues {
+		index, queue := index, queue
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+			printer := cfg.Printers[queue]
+			item := PrinterCapabilityDump{
+				Queue:       queue,
+				UpstreamURI: redactDumpString(printer.UpstreamURI),
+				DisplayName: printer.DisplayName,
+				Location:    printer.Location,
+				Optional:    printer.Optional,
 			}
+			resp, err := client.GetPrinterAttributes(ctx, printer.UpstreamURI)
+			if err != nil {
+				item.Error = safeProbeError(err, printer.UpstreamURI)
+				failedByIndex[index] = true
+			} else if resp == nil {
+				item.Error = "upstream returned an empty IPP response"
+				failedByIndex[index] = true
+			} else {
+				item.StatusCode = int(resp.Code)
+				item.Status = goipp.Status(resp.Code).String()
+				item.Attributes = dumpAttributes(resp.Printer)
+				if goipp.Status(resp.Code) >= goipp.StatusErrorBadRequest {
+					item.Error = safeProbeError(errors.New(statusMessage(resp)), printer.UpstreamURI)
+					if item.Error == "" {
+						item.Error = item.Status
+					}
+					failedByIndex[index] = true
+				}
+			}
+			report.Printers[index] = item
+		}()
+	}
+	wg.Wait()
+	failed := make([]string, 0)
+	for index, isFailed := range failedByIndex {
+		if isFailed {
+			failed = append(failed, queues[index])
 		}
-		report.Printers = append(report.Printers, item)
 	}
 
 	encoder := json.NewEncoder(output)
@@ -119,7 +140,9 @@ func dumpAttributes(attrs goipp.Attributes) []DumpAttribute {
 	if len(attrs) == 0 {
 		return nil
 	}
-	ordered := attrs.DeepCopy()
+	// Sorting changes only the outer slice. Avoid DeepCopy here because legal
+	// out-of-band values carry a nil Value that goipp cannot deep-copy.
+	ordered := attrs.Clone()
 	sort.SliceStable(ordered, func(i, j int) bool {
 		left, right := strings.ToLower(ordered[i].Name), strings.ToLower(ordered[j].Name)
 		if left == right {
@@ -129,28 +152,22 @@ func dumpAttributes(attrs goipp.Attributes) []DumpAttribute {
 	})
 	out := make([]DumpAttribute, 0, len(ordered))
 	for _, attr := range ordered {
-		values := make([]any, 0, len(attr.Values))
+		values := make([]DumpValue, 0, len(attr.Values))
 		for _, value := range attr.Values {
+			dumped := any(nil)
 			if sensitiveDumpAttribute(attr.Name) {
-				values = append(values, "[redacted]")
+				dumped = "[redacted]"
 			} else {
-				values = append(values, dumpValue(value.V))
+				dumped = dumpValue(value.V)
 			}
+			values = append(values, DumpValue{Tag: value.T.String(), Value: dumped})
 		}
 		out = append(out, DumpAttribute{
 			Name:   attr.Name,
-			Tag:    attrTag(attr),
 			Values: values,
 		})
 	}
 	return out
-}
-
-func attrTag(attr goipp.Attribute) string {
-	if len(attr.Values) == 0 {
-		return ""
-	}
-	return attr.Values[0].T.String()
 }
 
 func dumpValue(value goipp.Value) any {

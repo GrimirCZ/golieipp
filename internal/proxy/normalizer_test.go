@@ -14,7 +14,7 @@ func TestNormalizeJobAttrsDropsAndInjectsPolicy(t *testing.T) {
 		iattr.Keyword("media", "na_letter_8.5x11in"),
 		iattr.Keyword("media-type", "stationery-heavyweight"),
 		iattr.Keyword("print-color-mode", "color"),
-		iattr.Keyword("output-mode", "color"),
+		iattr.Keyword("output-mode", "monochrome"),
 		iattr.Keyword("ColorModel", "RGB"),
 		iattr.Keyword("sides", "two-sided-long-edge"),
 	}
@@ -267,6 +267,98 @@ func TestNormalizeJobAttrsSanitizesPolicyAttrsInsideOverrides(t *testing.T) {
 	}
 	if !iattr.HasStringValue(members, "sides", "two-sided-long-edge") {
 		t.Fatalf("non-policy override member was dropped: %#v", members)
+	}
+}
+
+func TestNormalizeJobAttrsOptionsWarnsAndRecordsPolicySubstitutions(t *testing.T) {
+	policy := config.PolicyConfig{
+		MediaSupported: []string{"iso_a4_210x297mm"},
+		MediaDefault:   "iso_a4_210x297mm",
+		MediaType:      "stationery",
+		PrintColorMode: "monochrome",
+	}
+	result, err := NormalizeJobAttrsWithOptions(goipp.Attributes{
+		iattr.Keyword("media", "na_letter_8.5x11in"),
+		iattr.Keyword("media-type", "stationery-heavyweight"),
+		iattr.Keyword("media-source", "tray-2"),
+		iattr.Keyword("print-color-mode", "color"),
+		iattr.Keyword("ColorModel", "RGB"),
+	}, NormalizationOptions{
+		Policy:          policy,
+		Fidelity:        true,
+		FidelityMode:    FidelityWarn,
+		DropVendorAttrs: []string{"ColorModel"},
+	})
+	if err != nil {
+		t.Fatalf("warn fidelity rejected well-formed conflicts: %v", err)
+	}
+	if !result.Substituted || len(result.Unsupported) < 4 || len(result.Substitutions) < 4 {
+		t.Fatalf("substitution evidence missing: %+v", result)
+	}
+	if !iattr.HasStringValue(result.Attrs, "media", "iso_a4_210x297mm") ||
+		!iattr.HasStringValue(result.Attrs, "media-type", "stationery") ||
+		!iattr.HasStringValue(result.Attrs, "print-color-mode", "monochrome") ||
+		!iattr.HasStringValue(result.Attrs, "output-mode", "monochrome") {
+		t.Fatalf("policy values were not canonicalized: %+v", result.Attrs)
+	}
+	if _, ok := iattr.Attr(result.Attrs, "ColorModel"); ok {
+		t.Fatal("dropped vendor attribute was forwarded")
+	}
+}
+
+func TestNormalizeJobAttrsOptionsRejectsOnlyFidelityPolicyConflicts(t *testing.T) {
+	policy := config.PolicyConfig{
+		MediaSupported: []string{"iso_a4_210x297mm"},
+		MediaDefault:   "iso_a4_210x297mm",
+		MediaType:      "stationery",
+		PrintColorMode: "monochrome",
+	}
+	attrs := goipp.Attributes{iattr.Keyword("media", "na_letter_8.5x11in")}
+	if _, err := NormalizeJobAttrsWithOptions(attrs, NormalizationOptions{
+		Policy: policy, Fidelity: true, FidelityMode: FidelityReject,
+	}); err == nil {
+		t.Fatal("reject fidelity accepted unsupported media")
+	} else if statusErr, ok := err.(*NormalizationError); !ok || statusErr.Status != goipp.StatusErrorAttributesOrValues {
+		t.Fatalf("unsupported media returned wrong error: %#v", err)
+	}
+	if _, err := NormalizeJobAttrsWithOptions(attrs, NormalizationOptions{
+		Policy: policy, Fidelity: false, FidelityMode: FidelityReject,
+	}); err != nil {
+		t.Fatalf("fidelity=false should permit substitution: %v", err)
+	}
+}
+
+func TestNormalizeJobAttrsOptionsRejectsMalformedAndHonorsPreserveAllowlist(t *testing.T) {
+	policy := config.PolicyConfig{Media: "iso_a4_210x297mm", MediaType: "stationery", PrintColorMode: "color"}
+	malformed := goipp.Attributes{goipp.MakeAttr("media", goipp.TagKeyword, goipp.String("iso_a4_210x297mm"), goipp.String("na_letter_8.5x11in"))}
+	if _, err := NormalizeJobAttrsWithOptions(malformed, NormalizationOptions{Policy: policy, Fidelity: false}); err == nil {
+		t.Fatal("malformed media was silently substituted")
+	}
+	result, err := NormalizeJobAttrsWithOptions(goipp.Attributes{
+		iattr.Keyword("copies", "1"),
+		iattr.Keyword("sides", "two-sided-long-edge"),
+		iattr.Keyword("unknown-vendor-attr", "x"),
+	}, NormalizationOptions{Policy: policy, PreserveJobAttrs: []string{"copies"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := iattr.Attr(result.Attrs, "sides"); ok {
+		t.Fatal("attribute outside preserve_job_attrs was forwarded")
+	}
+	if _, ok := iattr.Attr(result.Attrs, "unknown-vendor-attr"); ok {
+		t.Fatal("unknown attribute was forwarded")
+	}
+	if _, ok := iattr.Attr(result.Attrs, "copies"); !ok {
+		t.Fatal("allowlisted attribute was dropped")
+	}
+	if !result.Substituted || len(result.Unsupported) != 2 {
+		t.Fatalf("dropped attributes were not reported as substitutions: %+v", result)
+	}
+
+	if _, err := NormalizeJobAttrsWithOptions(goipp.Attributes{
+		iattr.Keyword("output-mode", "monochrome"),
+	}, NormalizationOptions{Policy: policy, Fidelity: true, FidelityMode: FidelityReject}); err == nil {
+		t.Fatal("conflicting output-mode bypassed fidelity rejection")
 	}
 }
 

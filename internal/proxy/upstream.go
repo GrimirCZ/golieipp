@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/OpenPrinting/goipp"
@@ -14,8 +17,10 @@ import (
 )
 
 type UpstreamClient struct {
-	HTTP   *http.Client
-	logger *slog.Logger
+	HTTP             *http.Client
+	MaxResponseBytes int64
+	ProbeTimeout     time.Duration
+	logger           *slog.Logger
 }
 
 func NewUpstreamClient(logger *slog.Logger) *UpstreamClient {
@@ -23,28 +28,37 @@ func NewUpstreamClient(logger *slog.Logger) *UpstreamClient {
 		logger = slog.Default()
 	}
 	return &UpstreamClient{
-		HTTP:   &http.Client{Timeout: 10 * time.Minute},
-		logger: logger,
+		HTTP: &http.Client{
+			Timeout: 10 * time.Minute,
+			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
+		MaxResponseBytes: 32 << 20,
+		ProbeTimeout:     30 * time.Second,
+		logger:           logger,
 	}
 }
 
 func (c *UpstreamClient) Do(ctx context.Context, upstreamURI string, msg *goipp.Message, payload io.Reader) (*goipp.Message, error) {
 	start := time.Now()
 	op := goipp.Op(msg.Code)
+	safeUpstreamURI := redactDumpString(upstreamURI)
 	httpURL, err := iattr.HTTPURLFromIPP(upstreamURI)
 	if err != nil {
 		c.logger.Debug("upstream uri conversion failed",
-			"upstream_uri", upstreamURI,
+			"upstream_uri", safeUpstreamURI,
 			"operation", op.String(),
 			"ipp_request_id", msg.RequestID,
 			"error", err,
 		)
 		return nil, err
 	}
+	safeHTTPURL := redactDumpString(httpURL)
 	envelope, err := msg.EncodeBytes()
 	if err != nil {
 		c.logger.Debug("upstream ipp encode failed",
-			"upstream_uri", upstreamURI,
+			"upstream_uri", safeUpstreamURI,
 			"operation", op.String(),
 			"ipp_request_id", msg.RequestID,
 			"error", err,
@@ -52,8 +66,8 @@ func (c *UpstreamClient) Do(ctx context.Context, upstreamURI string, msg *goipp.
 		return nil, err
 	}
 	c.logger.Debug("upstream ipp request attributes",
-		"upstream_uri", upstreamURI,
-		"http_url", httpURL,
+		"upstream_uri", safeUpstreamURI,
+		"http_url", safeHTTPURL,
 		"ipp_version", msg.Version.String(),
 		"operation", op.String(),
 		"ipp_request_id", msg.RequestID,
@@ -68,8 +82,8 @@ func (c *UpstreamClient) Do(ctx context.Context, upstreamURI string, msg *goipp.
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, httpURL, body)
 	if err != nil {
 		c.logger.Debug("upstream http request creation failed",
-			"upstream_uri", upstreamURI,
-			"http_url", httpURL,
+			"upstream_uri", safeUpstreamURI,
+			"http_url", safeHTTPURL,
 			"operation", op.String(),
 			"ipp_request_id", msg.RequestID,
 			"error", err,
@@ -79,8 +93,8 @@ func (c *UpstreamClient) Do(ctx context.Context, upstreamURI string, msg *goipp.
 	req.Header.Set("content-type", goipp.ContentType)
 	req.Header.Set("accept", goipp.ContentType)
 	c.logger.Debug("upstream ipp request started",
-		"upstream_uri", upstreamURI,
-		"http_url", httpURL,
+		"upstream_uri", safeUpstreamURI,
+		"http_url", safeHTTPURL,
 		"operation", op.String(),
 		"ipp_request_id", msg.RequestID,
 		"envelope_bytes", len(envelope),
@@ -93,8 +107,8 @@ func (c *UpstreamClient) Do(ctx context.Context, upstreamURI string, msg *goipp.
 	}
 	if err != nil {
 		c.logger.Debug("upstream ipp request failed",
-			"upstream_uri", upstreamURI,
-			"http_url", httpURL,
+			"upstream_uri", safeUpstreamURI,
+			"http_url", safeHTTPURL,
 			"operation", op.String(),
 			"ipp_request_id", msg.RequestID,
 			"duration_ms", time.Since(start).Milliseconds(),
@@ -102,10 +116,10 @@ func (c *UpstreamClient) Do(ctx context.Context, upstreamURI string, msg *goipp.
 		)
 		return nil, err
 	}
-	if resp.StatusCode/100 != 2 {
+	if resp.StatusCode != http.StatusOK {
 		c.logger.Debug("upstream ipp http status rejected",
-			"upstream_uri", upstreamURI,
-			"http_url", httpURL,
+			"upstream_uri", safeUpstreamURI,
+			"http_url", safeHTTPURL,
 			"operation", op.String(),
 			"ipp_request_id", msg.RequestID,
 			"duration_ms", time.Since(start).Milliseconds(),
@@ -113,11 +127,21 @@ func (c *UpstreamClient) Do(ctx context.Context, upstreamURI string, msg *goipp.
 		)
 		return nil, errors.New(resp.Status)
 	}
+	mediaType, _, mediaErr := mime.ParseMediaType(resp.Header.Get("content-type"))
+	if mediaErr != nil || !strings.EqualFold(mediaType, goipp.ContentType) {
+		return nil, fmt.Errorf("upstream returned content-type %q, expected %s", resp.Header.Get("content-type"), goipp.ContentType)
+	}
 	out := &goipp.Message{}
-	if err := out.Decode(resp.Body); err != nil {
+	responseBody := io.Reader(resp.Body)
+	var bounded *maxBytesReader
+	if c.MaxResponseBytes > 0 {
+		bounded = &maxBytesReader{Reader: resp.Body, Max: c.MaxResponseBytes}
+		responseBody = bounded
+	}
+	if err := out.Decode(responseBody); err != nil {
 		c.logger.Debug("upstream ipp response decode failed",
-			"upstream_uri", upstreamURI,
-			"http_url", httpURL,
+			"upstream_uri", safeUpstreamURI,
+			"http_url", safeHTTPURL,
 			"operation", op.String(),
 			"ipp_request_id", msg.RequestID,
 			"duration_ms", time.Since(start).Milliseconds(),
@@ -126,9 +150,33 @@ func (c *UpstreamClient) Do(ctx context.Context, upstreamURI string, msg *goipp.
 		)
 		return nil, err
 	}
+	if bounded != nil {
+		if _, err := io.Copy(io.Discard, bounded); err != nil {
+			if errors.Is(err, errReadLimitExceeded) {
+				return nil, fmt.Errorf("upstream IPP response exceeds %d bytes: %w", c.MaxResponseBytes, err)
+			}
+			return nil, fmt.Errorf("read upstream IPP response: %w", err)
+		}
+	}
+	if out.RequestID != msg.RequestID {
+		return nil, fmt.Errorf("upstream response request-id %d does not match request-id %d", out.RequestID, msg.RequestID)
+	}
+	if !supportedIPPVersion(out.Version) {
+		return nil, fmt.Errorf("upstream response uses unsupported IPP version %s", out.Version)
+	}
+	if ippSuccess(out) && ippVersionGreater(out.Version, msg.Version) {
+		return nil, fmt.Errorf("upstream response IPP version %s exceeds requested version %s", out.Version, msg.Version)
+	}
+	if err := validateUpstreamResponseGroups(out.Groups); err != nil {
+		return nil, err
+	}
+	if len(out.Operation) < 2 || !singleValueAttr(out.Operation[0], "attributes-charset", goipp.TagCharset) ||
+		!singleValueAttr(out.Operation[1], "attributes-natural-language", goipp.TagLanguage) {
+		return nil, errors.New("upstream response is missing required leading operation attributes")
+	}
 	c.logger.Debug("upstream ipp response attributes",
-		"upstream_uri", upstreamURI,
-		"http_url", httpURL,
+		"upstream_uri", safeUpstreamURI,
+		"http_url", safeHTTPURL,
 		"ipp_version", out.Version.String(),
 		"operation", op.String(),
 		"ipp_request_id", out.RequestID,
@@ -139,8 +187,8 @@ func (c *UpstreamClient) Do(ctx context.Context, upstreamURI string, msg *goipp.
 		"groups", logMessageGroups(out),
 	)
 	c.logger.Debug("upstream ipp request completed",
-		"upstream_uri", upstreamURI,
-		"http_url", httpURL,
+		"upstream_uri", safeUpstreamURI,
+		"http_url", safeHTTPURL,
 		"operation", op.String(),
 		"ipp_request_id", msg.RequestID,
 		"duration_ms", time.Since(start).Milliseconds(),
@@ -152,6 +200,39 @@ func (c *UpstreamClient) Do(ctx context.Context, upstreamURI string, msg *goipp.
 		"job_attr_count", len(out.Job),
 	)
 	return out, nil
+}
+
+func ippVersionGreater(left, right goipp.Version) bool {
+	if left.Major() != right.Major() {
+		return left.Major() > right.Major()
+	}
+	return left.Minor() > right.Minor()
+}
+
+func validateUpstreamResponseGroups(groups goipp.Groups) error {
+	if len(groups) == 0 || groups[0].Tag != goipp.TagOperationGroup {
+		return errors.New("upstream response must begin with exactly one operation attributes group")
+	}
+	seenOperation := false
+	seenUnsupported := false
+	seenObject := false
+	for index, group := range groups {
+		switch group.Tag {
+		case goipp.TagOperationGroup:
+			if seenOperation || index != 0 {
+				return errors.New("upstream response contains duplicate or misplaced operation attributes group")
+			}
+			seenOperation = true
+		case goipp.TagUnsupportedGroup:
+			if seenUnsupported || seenObject || index > 1 {
+				return errors.New("upstream response contains duplicate or misplaced unsupported attributes group")
+			}
+			seenUnsupported = true
+		default:
+			seenObject = true
+		}
+	}
+	return nil
 }
 
 type logGroup struct {
@@ -206,9 +287,15 @@ func logMessageGroups(msg *goipp.Message) []logGroup {
 func logAttributes(attrs goipp.Attributes) []logAttr {
 	out := make([]logAttr, 0, len(attrs))
 	for _, attr := range attrs {
+		values := logValues(attr.Values)
+		if sensitiveDumpAttribute(attr.Name) {
+			for index := range values {
+				values[index].Value = "[redacted]"
+			}
+		}
 		out = append(out, logAttr{
 			Name:   attr.Name,
-			Values: logValues(attr.Values),
+			Values: values,
 		})
 	}
 	return out
@@ -219,7 +306,7 @@ func logValues(values goipp.Values) []logValue {
 	for _, value := range values {
 		display := "<nil>"
 		if value.V != nil {
-			display = value.V.String()
+			display = redactDumpString(value.V.String())
 		}
 		out = append(out, logValue{
 			Tag:   value.T.String(),
@@ -230,6 +317,11 @@ func logValues(values goipp.Values) []logValue {
 }
 
 func (c *UpstreamClient) GetPrinterAttributes(ctx context.Context, upstreamURI string) (*goipp.Message, error) {
+	if c.ProbeTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, c.ProbeTimeout)
+		defer cancel()
+	}
 	req := goipp.NewRequest(goipp.DefaultVersion, goipp.OpGetPrinterAttributes, uint32(time.Now().UnixNano()))
 	req.Operation = iattr.BasicOperationAttrs(upstreamURI)
 	req.Operation = append(req.Operation,

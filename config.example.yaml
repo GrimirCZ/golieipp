@@ -3,12 +3,30 @@ listen:
   public_base_url: "ipp://print-proxy.example.cz:8631/printers"
 storage:
   sqlite_path: "jobs.db"
+defaults:
+  max_envelope_bytes: "1MiB"
+  max_document_bytes: "1GiB"
+  max_upstream_response_bytes: "32MiB"
+  max_concurrent_payload_jobs_per_queue: 2
+  job_retention: "30d"
+dns_sd:
+  # auto attempts Avahi publication in Linux builds tagged "avahi". A
+  # missing daemon degrades discovery only; IPP service stays available.
+  mode: auto
+  hostname: ""
+  interface: ""
 printers:
   office-a4-bw:
     upstream_uri: "ipp://192.168.10.50/ipp/print"
     display_name: "Office A4 B&W"
     location: "Office"
     optional: false
+    # Trust and mirror the upstream ipp-everywhere feature claim. "required"
+    # keeps the queue inactive unless the upstream makes that claim;
+    # "disabled" suppresses both feature values and DNS-SD publication.
+    ipp_everywhere_mode: auto
+    dns_sd: true
+    geo_location: ""
     refresh_interval: "5m"
     policy:
       # Every value must be advertised by the upstream printer. Add more
@@ -21,8 +39,12 @@ printers:
       media_source: null
       print_scaling: "fit"
       use_media_col: false
+      # warn enforces policy and reports substitutions even when the client
+      # requests fidelity. reject honors fidelity by rejecting conflicts.
+      fidelity_mode: warn
     passthrough:
-      allow_unknown_attributes: true
+      # This is the authoritative allowlist. Unknown attributes are dropped;
+      # the former allow_unknown_attributes option is deprecated/no-op.
       preserve_job_attrs:
         - copies
         - sides

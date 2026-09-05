@@ -2,6 +2,7 @@ package ipp
 
 import (
 	"fmt"
+	"net"
 	"net/url"
 	"strings"
 
@@ -135,11 +136,20 @@ func HTTPURLFromIPP(raw string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if u.Hostname() == "" {
+		return "", fmt.Errorf("IPP URI must include a host")
+	}
 	switch strings.ToLower(u.Scheme) {
 	case "ipp":
 		u.Scheme = "http"
+		if u.Port() == "" {
+			u.Host = net.JoinHostPort(u.Hostname(), "631")
+		}
 	case "ipps":
 		u.Scheme = "https"
+		if u.Port() == "" {
+			u.Host = net.JoinHostPort(u.Hostname(), "631")
+		}
 	case "http", "https":
 	default:
 		return "", fmt.Errorf("unsupported upstream URI scheme %q", u.Scheme)

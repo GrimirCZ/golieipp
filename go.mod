@@ -4,6 +4,7 @@ go 1.26.4
 
 require (
 	github.com/OpenPrinting/goipp v1.2.0
+	github.com/godbus/dbus/v5 v5.1.0
 	github.com/google/uuid v1.6.0
 	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.52.0

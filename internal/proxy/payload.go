@@ -3,6 +3,9 @@ package proxy
 import (
 	"bufio"
 	"bytes"
+	"context"
+	"errors"
+	"fmt"
 	"io"
 	"os"
 	"regexp"
@@ -21,6 +24,89 @@ type PayloadMetadata struct {
 type payloadRecorder struct {
 	file *os.File
 	body io.Reader
+}
+
+// stagedPayload is a complete request document captured before dispatch. It
+// is used only when the client did not provide Content-Length, because a
+// streaming upstream request could otherwise be accepted before the proxy
+// discovers a size or read error at the end of the client body.
+type stagedPayload struct {
+	file *os.File
+	path string
+}
+
+func stageUnknownPayload(ctx context.Context, source io.Reader, closeBody io.Closer, max int64) (*stagedPayload, error) {
+	if source == nil || closeBody == nil {
+		return nil, errors.New("missing request body")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	file, err := os.CreateTemp("", "golieipp-staged-payload-*")
+	if err != nil {
+		return nil, err
+	}
+	path := file.Name()
+	removeOnError := true
+	defer func() {
+		if removeOnError {
+			_ = file.Close()
+			_ = os.Remove(path)
+		}
+	}()
+
+	// Closing the original HTTP request body is the portable way to interrupt a
+	// blocked network read when the request context is canceled. The source may
+	// be a buffered reader whose initial byte has already been peeked; the
+	// callback must therefore close closeBody rather than source.
+	stopClose := context.AfterFunc(ctx, func() { _ = closeBody.Close() })
+	defer stopClose()
+
+	limited := &maxBytesReader{Reader: source, Max: max}
+	buffer := make([]byte, 64*1024)
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		n, readErr := limited.Read(buffer)
+		if n > 0 {
+			if _, err := file.Write(buffer[:n]); err != nil {
+				return nil, fmt.Errorf("stage request document: %w", err)
+			}
+		}
+		if readErr == nil {
+			continue
+		}
+		if errors.Is(ctx.Err(), context.Canceled) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return nil, ctx.Err()
+		}
+		if readErr == io.EOF {
+			break
+		}
+		return nil, readErr
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return nil, fmt.Errorf("rewind staged request document: %w", err)
+	}
+	removeOnError = false
+	return &stagedPayload{file: file, path: path}, nil
+}
+
+func (p *stagedPayload) Reader() io.Reader {
+	if p == nil {
+		return nil
+	}
+	return p.file
+}
+
+func (p *stagedPayload) Close() error {
+	if p == nil {
+		return nil
+	}
+	return errors.Join(p.file.Close(), os.Remove(p.path))
 }
 
 func newPayloadRecorder(payload io.Reader) (*payloadRecorder, error) {

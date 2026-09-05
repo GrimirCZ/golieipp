@@ -66,10 +66,10 @@ func TestDumpPrinterCapabilitiesIncludesRawUpstreamMediaAndAttemptsEveryQueue(t 
 	mediaFound := false
 	passwordLeaked := false
 	for _, attr := range report.Printers[0].Attributes {
-		if attr.Name == "media-supported" && strings.Contains(strings.Join(fmtAny(attr.Values), ","), "na_letter_8.5x11in") {
+		if attr.Name == "media-supported" && strings.Contains(strings.Join(fmtDumpValues(attr.Values), ","), "na_letter_8.5x11in") {
 			mediaFound = true
 		}
-		if attr.Name == "job-password" && strings.Contains(strings.Join(fmtAny(attr.Values), ","), "should-not-leak") {
+		if attr.Name == "job-password" && strings.Contains(strings.Join(fmtDumpValues(attr.Values), ","), "should-not-leak") {
 			passwordLeaked = true
 		}
 	}
@@ -89,10 +89,34 @@ func TestDumpPrinterCapabilitiesIncludesRawUpstreamMediaAndAttemptsEveryQueue(t 
 	}
 }
 
-func fmtAny(values []any) []string {
+func fmtDumpValues(values []DumpValue) []string {
 	out := make([]string, len(values))
 	for i, value := range values {
-		out[i] = fmt.Sprint(value)
+		out[i] = fmt.Sprint(value.Value)
 	}
 	return out
+}
+
+func TestDumpAttributesKeepsPerValueTagsAndRecursivelyRedacts(t *testing.T) {
+	mixed := goipp.Attribute{Name: "mixed", Values: goipp.Values{
+		{T: goipp.TagKeyword, V: goipp.String("plain")},
+		{T: goipp.TagNoValue, V: nil},
+	}}
+	nested := goipp.MakeAttribute("container", goipp.TagBeginCollection, goipp.Collection{
+		goipp.MakeAttribute("auth-info-password", goipp.TagText, goipp.String("top-secret")),
+	})
+	attrs := dumpAttributes(goipp.Attributes{nested, mixed})
+	if len(attrs) != 2 || attrs[0].Name != "container" || attrs[1].Name != "mixed" {
+		t.Fatalf("attributes not deterministically sorted: %#v", attrs)
+	}
+	if got := attrs[1].Values[0].Tag; got != goipp.TagKeyword.String() {
+		t.Fatalf("first tag = %q", got)
+	}
+	if got := attrs[1].Values[1].Tag; got != goipp.TagNoValue.String() {
+		t.Fatalf("out-of-band tag = %q", got)
+	}
+	nestedAttrs, ok := attrs[0].Values[0].Value.([]DumpAttribute)
+	if !ok || len(nestedAttrs) != 1 || nestedAttrs[0].Values[0].Value != "[redacted]" {
+		t.Fatalf("nested secret was not redacted: %#v", attrs[0].Values[0].Value)
+	}
 }

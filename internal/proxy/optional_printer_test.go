@@ -108,6 +108,80 @@ func TestRefreshLoopActivatesOptionalPrinterImmediately(t *testing.T) {
 	}
 }
 
+func TestCloseCancelsAndWaitsForRefreshProbe(t *testing.T) {
+	probeStarted := make(chan struct{})
+	probeCanceled := make(chan struct{})
+	allowTransportExit := make(chan struct{})
+	transport := &blockingRoundTripper{
+		started:  probeStarted,
+		canceled: probeCanceled,
+		release:  allowTransportExit,
+	}
+
+	svc := newRefreshTestService(t, config.PrinterConfig{
+		UpstreamURI:     "ipp://printer.example.test/ipp/print",
+		Optional:        true,
+		RefreshInterval: time.Hour,
+	})
+	svc.upstream.HTTP.Transport = transport
+	releaseTransport := func() {
+		select {
+		case <-allowTransportExit:
+		default:
+			close(allowTransportExit)
+		}
+	}
+	t.Cleanup(func() {
+		releaseTransport()
+	})
+
+	ctx := context.Background()
+	go svc.StartRefreshLoop(ctx)
+	select {
+	case <-probeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("refresh probe did not start")
+	}
+
+	closed := make(chan error, 1)
+	go func() { closed <- svc.Close() }()
+	select {
+	case <-closed:
+		t.Fatal("Close returned before the in-flight refresh probe was canceled")
+	case <-time.After(50 * time.Millisecond):
+	}
+	select {
+	case <-probeCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("Close did not cancel the in-flight refresh probe")
+	}
+	select {
+	case <-closed:
+		t.Fatal("Close returned before the in-flight refresh probe finished")
+	case <-time.After(50 * time.Millisecond):
+	}
+	releaseTransport()
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("Close did not wait for the refresh loop to finish")
+	}
+}
+
+type blockingRoundTripper struct {
+	started  chan<- struct{}
+	canceled chan<- struct{}
+	release  <-chan struct{}
+}
+
+func (t *blockingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	close(t.started)
+	<-req.Context().Done()
+	close(t.canceled)
+	<-t.release
+	return nil, req.Context().Err()
+}
+
 func newRefreshTestService(t *testing.T, printer config.PrinterConfig) *Service {
 	t.Helper()
 	if printer.DisplayName == "" {

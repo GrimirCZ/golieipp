@@ -18,6 +18,11 @@ go run ./cmd/golieipp -config config.yaml -debug
 
 Debug logs are structured JSON and include request correlation IDs, IPP operation/request IDs, upstream HTTP status, upstream IPP status, and timing. Document payload bytes are not logged.
 
+`GET /healthz` is process liveness. `GET /readyz` returns JSON for every queue,
+including active/stale state, the last refresh error, IPP Everywhere eligibility,
+and DNS-SD degradation. A required inactive queue makes readiness return 503;
+an inactive optional queue or a stale last-known-good snapshot does not.
+
 Dump the raw capabilities of every configured upstream printer without starting
 the proxy or opening its SQLite job store:
 
@@ -44,6 +49,10 @@ Build the Linux binary:
 ```sh
 make linux-x86
 ```
+
+The official Linux target and Docker image include the `avahi` build tag. A
+minimal or non-Linux build can omit it (`make build TAGS=`); IPP remains usable
+but multicast discovery is unavailable.
 
 Create the service user and installation directory:
 
@@ -101,6 +110,13 @@ Build and start the container:
 docker compose up --build -d
 ```
 
+DNS-SD from a container is intentionally not enabled by the supplied Compose
+file. To publish through the host Avahi daemon, the deployment must deliberately
+expose the system D-Bus socket, grant an Avahi/D-Bus policy to the container
+user, and allow mDNS multicast (UDP 5353) on the selected network. Those are
+host-specific security decisions; do not mount the system bus broadly without
+a restrictive policy. Direct `ipp://`/`ipps://` queue URLs work without them.
+
 Check service status and logs:
 
 ```sh
@@ -145,13 +161,39 @@ Use the output to fill:
 
 - `printers.<queue>.upstream_uri`: the `UPSTREAM_URI` used for the probe.
 - `printers.<queue>.optional`: set to `true` to let the proxy start while this printer is offline. Optional printers are probed in the background immediately after startup and then at `refresh_interval`; the queue returns `printer-is-deactivated` until the first successful probe.
+- `printers.<queue>.ipp_everywhere_mode`: `auto` trusts an upstream
+  `ipp-features-supported=ipp-everywhere` claim, `required` leaves the queue
+  inactive without that claim, and `disabled` suppresses the proxy feature and
+  discovery advertisement. This is a compatibility advertisement, not proof
+  that the proxy passed the PWG self-certification suite.
+- `printers.<queue>.dns_sd`: opt a queue out of DNS-SD while retaining IPP
+  Everywhere feature attributes. Avahi loss is reported as degraded and
+  retried; it never deactivates an otherwise usable queue.
+- `printers.<queue>.geo_location`: optional `geo:` URI used for a DNS LOC
+  record when the upstream does not provide `printer-geo-location`.
 - `printers.<queue>.location`: optional override for the advertised `printer-location`; use `""` or omit it to advertise an empty location.
 - `policy.media_supported`: choose one or more values advertised in `media-supported`, for example `iso_a4_210x297mm` and `na_letter_8.5x11in`.
 - `policy.media_default`: choose the value used when a client omits media or requests an unsupported/malformed media value. It must be one of `media_supported`.
 - `policy.media`: legacy single-size configuration; it is promoted to a one-item `media_supported` list and its default. Do not combine it with the new fields.
 - `policy.print_color_mode`: choose a value advertised in `print-color-mode-supported`, usually `monochrome` for this proxy's default policy.
 - `policy.media_type`: choose a value from `media-type-supported`, if the printer advertises it; otherwise the default `stationery` is used.
-- `policy.media_source`: choose a value from `media-source-supported` when you need to force a tray, otherwise leave it `null` to advertise automatic (`auto`) media-source selection.
+- `policy.media_source`: choose a value from `media-source-supported` when you need to force a tray. When unset, the proxy uses an upstream-proven `auto` source, otherwise the upstream default, and otherwise omits the source rather than inventing one.
+- `policy.fidelity_mode`: `warn` (default) enforces configured media/color
+  policy and returns `successful-ok-ignored-or-substituted-attributes` plus an
+  Unsupported group for well-formed conflicts, even when the client asks for
+  fidelity. `reject` rejects those conflicts when fidelity is true. Malformed
+  and unsafe values are always rejected.
+- `passthrough.preserve_job_attrs`: the authoritative allowlist for
+  non-policy job-template attributes. `allow_unknown_attributes` is accepted
+  only for migration, logs a deprecation warning, and has no effect.
+
+Global `defaults` bound IPP envelopes (1 MiB), documents (1 GiB), upstream
+responses (32 MiB), concurrent payload jobs per queue (2), and terminal-job
+retention (30 days). All are configurable as shown in `config.example.yaml`.
+
+Avahi capability refreshes replace DNS-SD TXT records on the existing entry
+group. Structural records (service endpoint, interface, and LOC) are fixed for
+that publisher lifetime and therefore require a proxy restart to change.
 
 ## Implemented IPP operations
 
@@ -160,9 +202,38 @@ Use the output to fill:
 - `Print-Job`
 - `Create-Job`
 - `Send-Document`
-- `Close-Job`
+- `Close-Job` (only when upstream-supported)
 - `Get-Job-Attributes`
 - `Get-Jobs`
-- `Cancel-My-Jobs`
-- `Identify-Printer`
+- `Cancel-My-Jobs` (emulated over proxy-owned mapped jobs)
+- `Identify-Printer` (only when upstream-supported)
 - `Cancel-Job`
+
+`Get-Jobs` is a live upstream query joined against the SQLite registry; jobs
+that did not enter through this proxy are not exposed. `my-jobs` filters by the
+requesting user name recorded at submission time. This is namespace isolation,
+not authentication—deploy transport authentication separately when users are
+not mutually trusted.
+
+The Create-Job/Send-Document path supports one document. That document can be
+sent with either value of `last-document`; when it is false, finish the job with
+a no-data Send-Document carrying `last-document=true`. A second document is
+rejected with `client-error-multiple-jobs-not-supported`.
+
+## Verification
+
+The release gate is:
+
+```sh
+go test ./...
+go test -race ./...
+go test -tags avahi ./...
+go test -race -tags avahi ./...
+go vet ./...
+go vet -tags avahi ./...
+git diff --check
+```
+
+`ipptool`, PWG self-certification, macOS queue creation, and live Avahi browsing
+remain recommended external interoperability checks; they are not performed by
+the Go test suite.

@@ -2,7 +2,10 @@ package store
 
 import (
 	"context"
+	"errors"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestStoreCreateAndLookupJob(t *testing.T) {
@@ -78,6 +81,89 @@ func TestStoreUpdatePayloadMetadataAddsDocumentCounters(t *testing.T) {
 	}
 	if job.PayloadBytes != 75 || job.PageCount == nil || *job.PageCount != 4 || job.EstimatedImpressions == nil || *job.EstimatedImpressions != 8 {
 		t.Fatalf("metadata was not accumulated: %+v", job)
+	}
+}
+
+func TestStoreRepeatedTerminalObservationsPreserveFirstTerminalAt(t *testing.T) {
+	s, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	id, err := s.Reserve(ctx, Job{Queue: "office"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+	second := first.Add(time.Hour)
+
+	if err := s.MarkTerminalAt(ctx, id, "completed", "", first); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkTerminalAt(ctx, id, "failed", "later failure", second); err != nil {
+		t.Fatal(err)
+	}
+
+	job, err := s.GetByProxyID(ctx, "office", id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.TerminalAt == nil || !job.TerminalAt.Equal(first) {
+		t.Fatalf("repeated terminal observation replaced first terminal_at: got %v, want %v", job.TerminalAt, first)
+	}
+	if job.ObservedState != "failed" || job.ObservedError != "later failure" {
+		t.Fatalf("latest terminal observation was not retained: %+v", job)
+	}
+}
+
+func TestStoreConcurrentObservedUpdateCannotOverwriteTerminal(t *testing.T) {
+	s, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	const iterations = 100
+	for iteration := 0; iteration < iterations; iteration++ {
+		id, err := s.Reserve(ctx, Job{Queue: "office"})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		start := make(chan struct{})
+		var group sync.WaitGroup
+		var observedErr, terminalErr error
+		group.Add(2)
+		go func() {
+			defer group.Done()
+			<-start
+			observedErr = s.UpdateObserved(ctx, id, "processing", "stale observation")
+		}()
+		go func() {
+			defer group.Done()
+			<-start
+			terminalErr = s.MarkTerminalAt(ctx, id, "completed", "", time.Unix(int64(iteration+1), 0).UTC())
+		}()
+		close(start)
+		group.Wait()
+
+		if terminalErr != nil {
+			t.Fatalf("iteration %d: MarkTerminal failed: %v", iteration, terminalErr)
+		}
+		if observedErr != nil && !errors.Is(observedErr, ErrInvalidTransition) {
+			t.Fatalf("iteration %d: unexpected UpdateObserved error: %v", iteration, observedErr)
+		}
+
+		job, err := s.GetByProxyID(ctx, "office", id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if job.State != StateTerminal || job.ObservedState != "completed" || job.ObservedError != "" {
+			t.Fatalf("iteration %d: nonterminal observation overwrote terminal result: %+v", iteration, job)
+		}
 	}
 }
 

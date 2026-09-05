@@ -6,7 +6,12 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/golieipp ./cmd/golieipp
+ARG TAGS="avahi"
+RUN if [ -n "$TAGS" ]; then \
+	CGO_ENABLED=0 GOOS=linux go build -tags "$TAGS" -trimpath -ldflags="-s -w" -o /out/golieipp ./cmd/golieipp; \
+else \
+	CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/golieipp ./cmd/golieipp; \
+fi
 
 FROM alpine:3.23
 

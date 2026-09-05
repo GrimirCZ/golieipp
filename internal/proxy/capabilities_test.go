@@ -95,21 +95,11 @@ func TestFilterPrinterAttributesRestrictsPolicyAndPreservesOtherCaps(t *testing.
 			t.Fatalf("%s operation missing", op)
 		}
 	}
-	if _, ok := iattr.Attr(out, "overrides-supported"); !ok {
-		t.Fatal("overrides-supported missing")
+	if _, ok := iattr.Attr(out, "overrides-supported"); ok {
+		t.Fatalf("unsafe overrides-supported capability was advertised: %#v", out)
 	}
-	if !iattr.HasStringValue(out, "overrides-supported", "document-number") || !iattr.HasStringValue(out, "overrides-supported", "pages") {
-		t.Fatalf("standards-required override targets missing: %#v", out)
-	}
-	if iattr.HasStringValue(out, "overrides-supported", "document-numbers") || iattr.HasStringValue(out, "overrides-supported", "media") || iattr.HasStringValue(out, "overrides-supported", "media-col") {
-		t.Fatalf("upstream override targets leaked: %#v", out)
-	}
-	mediaSource, ok := iattr.Attr(out, "media-source-supported")
-	if !ok || len(mediaSource.Values) != 1 || mediaSource.Values[0].T != goipp.TagKeyword || !iattr.HasStringValue(out, "media-source-supported", "auto") {
-		t.Fatalf("nil media-source policy did not advertise keyword auto: %#v", mediaSource)
-	}
-	if !iattr.HasStringValue(out, "media-source-default", "auto") {
-		t.Fatal("nil media-source policy did not advertise auto default")
+	if _, ok := iattr.Attr(out, "media-source-supported"); ok {
+		t.Fatal("nil media-source policy invented auto without upstream proof")
 	}
 	if got, ok := iattr.FirstString(out, "multiple-document-jobs-supported"); !ok || got != "false" {
 		t.Fatal("multiple-document-jobs-supported was not disabled")
@@ -117,8 +107,8 @@ func TestFilterPrinterAttributesRestrictsPolicyAndPreservesOtherCaps(t *testing.
 	if iattr.HasStringValue(out, "pwg-raster-document-type-supported", "srgb_8") {
 		t.Fatal("upstream color raster type leaked")
 	}
-	if !iattr.HasStringValue(out, "pwg-raster-document-type-supported", "sgray_8") {
-		t.Fatal("filtered grayscale raster type missing")
+	if _, ok := iattr.Attr(out, "pwg-raster-document-type-supported"); ok {
+		t.Fatal("incomplete PWG Raster family was advertised")
 	}
 	if _, ok := iattr.Attr(out, "urf-supported"); ok {
 		t.Fatal("URF capability was advertised without image/urf document-format support")
@@ -348,8 +338,8 @@ func TestBuildMediaCatalogUsesMinimumSupportedMarginsForMissingCollection(t *tes
 		t.Fatalf("unexpected catalog: %+v", catalog)
 	}
 	a3 := catalog.Sizes[1]
-	if a3.BottomMargin != 0 || a3.LeftMargin != 100 || a3.RightMargin != 250 || a3.TopMargin != 50 {
-		t.Fatalf("minimum supported margins were not selected: %+v", a3)
+	if a3.HasBottomMargin || a3.HasLeftMargin || a3.HasRightMargin || a3.HasTopMargin {
+		t.Fatalf("unknown margins were invented from global supported values: %+v", a3)
 	}
 	for _, size := range catalog.Sizes {
 		if !size.HasDimension {
@@ -375,8 +365,8 @@ func TestBuildMediaCatalogIgnoresMalformedOrRangedMargins(t *testing.T) {
 	}
 	catalog := buildMediaCatalog(upstream, policy)
 	size := catalog.Sizes[0]
-	if size.BottomMargin != 0 || size.LeftMargin != 200 || size.RightMargin != 0 || size.TopMargin != 0 {
-		t.Fatalf("malformed/ranged margin handling was not deterministic: %+v", size)
+	if size.HasBottomMargin || size.HasLeftMargin || size.HasRightMargin || size.HasTopMargin {
+		t.Fatalf("malformed/ranged margins were not left unknown: %+v", size)
 	}
 }
 
@@ -398,6 +388,401 @@ func TestValidatePolicyRequiresExactMediaForLooseMode(t *testing.T) {
 	col.Policy.UseMediaCol = true
 	if err := ValidatePolicyAgainstUpstream(upstream, col); err != nil {
 		t.Fatalf("media-col mode did not use collection/dimension fallback: %v", err)
+	}
+}
+
+func TestBuildMediaCatalogKeepsDistinctInstancesAndUnknownMargins(t *testing.T) {
+	policy := config.PolicyConfig{
+		MediaSupported: []string{"iso_a4_210x297mm"},
+		MediaDefault:   "iso_a4_210x297mm",
+		MediaType:      "stationery",
+	}
+	upstream := goipp.Attributes{
+		iattr.Keyword("media-supported", "iso_a4_210x297mm"),
+		goipp.MakeAttr("media-col-database", goipp.TagBeginCollection,
+			goipp.Collection{
+				iattr.Keyword("media-size-name", "iso_a4_210x297mm"),
+				iattr.Keyword("media-source", "tray-1"),
+				iattr.Keyword("media-type", "stationery"),
+				goipp.MakeAttrCollection("media-size", iattr.Integer("x-dimension", 21000), iattr.Integer("y-dimension", 29700)),
+				iattr.Integer("media-bottom-margin", 0),
+			}),
+		goipp.MakeAttr("media-col-database", goipp.TagBeginCollection,
+			goipp.Collection{
+				iattr.Keyword("media-size-name", "iso_a4_210x297mm"),
+				iattr.Keyword("media-source", "tray-2"),
+				iattr.Keyword("media-type", "stationery"),
+				goipp.MakeAttrCollection("media-size", iattr.Integer("x-dimension", 21000), iattr.Integer("y-dimension", 29700)),
+				iattr.Integer("media-bottom-margin", 500),
+				iattr.Integer("media-left-margin", 500),
+				iattr.Integer("media-right-margin", 500),
+				iattr.Integer("media-top-margin", 500),
+			}),
+	}
+
+	catalog := buildMediaCatalog(upstream, policy)
+	if len(catalog.Sizes) != 2 || len(catalog.Instances) != 2 {
+		t.Fatalf("expected two complete media instances, got sizes=%+v instances=%+v", catalog.Sizes, catalog.Instances)
+	}
+	first, second := catalog.Instances[0], catalog.Instances[1]
+	if first.MediaSource != "tray-1" || second.MediaSource != "tray-2" {
+		t.Fatalf("media source identity was lost: %+v %+v", first, second)
+	}
+	if !first.HasBottomMargin || first.BottomMargin != 0 || first.HasLeftMargin {
+		t.Fatalf("known zero and unknown margins were not distinguished: %+v", first)
+	}
+	if !second.HasLeftMargin || second.LeftMargin != 500 {
+		t.Fatalf("non-zero margin was not retained: %+v", second)
+	}
+	if selected := catalog.ByName[mediaNameKey(policy.MediaDefault)]; selected.MediaSource != "tray-2" {
+		t.Fatalf("ordinary default did not prefer the non-borderless instance: %+v", selected)
+	}
+}
+
+func TestFilterPrinterAttributesSynthesizesColorAndCoupledRasterFamilies(t *testing.T) {
+	printer := config.PrinterConfig{
+		DisplayName: "Color",
+		Policy: config.PolicyConfig{
+			Media:          "iso_a4_210x297mm",
+			MediaType:      "stationery",
+			PrintColorMode: "color",
+		},
+	}
+	upstream := goipp.Attributes{
+		iattr.Keywords("media-supported", "iso_a4_210x297mm"),
+		goipp.MakeAttr("document-format-supported", goipp.TagMimeType,
+			goipp.String("application/pdf"), goipp.String("image/pwg-raster"), goipp.String("image/urf")),
+		iattr.Keywords("pwg-raster-document-type-supported", "srgb_8", "sgray_8"),
+		goipp.MakeAttribute("pwg-raster-document-resolution-supported", goipp.TagResolution,
+			goipp.Resolution{Xres: 300, Yres: 300, Units: goipp.UnitsDpi}),
+		iattr.Keyword("pwg-raster-document-sheet-back", "normal"),
+		iattr.Keywords("urf-supported", "W8-16", "SRGB24", "RS300"),
+		iattr.Keywords("media-source-supported", "auto"),
+	}
+	out := FilterPrinterAttributes(upstream, "color", "ipp://proxy/printers/color", printer)
+	if !iattr.HasStringValue(out, "print-color-mode-supported", "color") ||
+		!iattr.HasStringValue(out, "output-mode-supported", "color") {
+		t.Fatalf("configured color mode was not synthesized end-to-end: %+v", out)
+	}
+	if color, ok := iattr.FirstString(out, "color-supported"); !ok || color != "true" {
+		t.Fatalf("color-supported did not match color policy: %q", color)
+	}
+	resolution, ok := iattr.Attr(out, "pwg-raster-document-resolution-supported")
+	validResolution := ok && len(resolution.Values) == 1 && resolution.Values[0].T == goipp.TagResolution && resolution.Values[0].V == (goipp.Resolution{Xres: 300, Yres: 300, Units: goipp.UnitsDpi})
+	if !iattr.HasStringValue(out, "pwg-raster-document-type-supported", "srgb_8") ||
+		!validResolution || !iattr.HasStringValue(out, "pwg-raster-document-sheet-back", "normal") {
+		t.Fatalf("complete PWG Raster family missing: %+v", out)
+	}
+	if iattr.HasStringValue(out, "pwg-raster-document-type-supported", "sgray_8") {
+		t.Fatal("incompatible monochrome raster type leaked into color capabilities")
+	}
+	if _, ok := iattr.Attr(out, "urf-supported"); !ok {
+		t.Fatal("complete URF capability was not retained")
+	}
+}
+
+func TestFilterPrinterAttributesDoesNotAdvertiseIncompleteRasterOrURF(t *testing.T) {
+	printer := config.PrinterConfig{Policy: config.PolicyConfig{
+		Media:          "iso_a4_210x297mm",
+		MediaType:      "stationery",
+		PrintColorMode: "monochrome",
+	}}
+	upstream := goipp.Attributes{
+		iattr.Keyword("media-supported", "iso_a4_210x297mm"),
+		goipp.MakeAttr("document-format-supported", goipp.TagMimeType,
+			goipp.String("application/pdf"), goipp.String("image/pwg-raster"), goipp.String("image/urf")),
+		iattr.Keyword("pwg-raster-document-type-supported", "sgray_8"),
+		iattr.Keywords("urf-supported", "W8-16", "SRGB24"), // missing RS resolution token
+	}
+	out := FilterPrinterAttributes(upstream, "mono", "ipp://proxy/printers/mono", printer)
+	if _, ok := iattr.Attr(out, "pwg-raster-document-type-supported"); ok {
+		t.Fatal("PWG Raster type was advertised without resolution and sheet-back")
+	}
+	if _, ok := iattr.Attr(out, "pwg-raster-document-resolution-supported"); ok {
+		t.Fatal("PWG Raster resolution leaked without a complete family")
+	}
+	if _, ok := iattr.Attr(out, "urf-supported"); ok {
+		t.Fatal("incomplete URF capability was advertised")
+	}
+	formats, _ := iattr.Attr(out, "document-format-supported")
+	if hasString(formats, "image/pwg-raster") || hasString(formats, "image/urf") {
+		t.Fatalf("incomplete raster formats leaked: %+v", formats)
+	}
+}
+
+func TestFilterPrinterAttributesRejectsMalformedPWGRasterValueTags(t *testing.T) {
+	printer := config.PrinterConfig{Policy: config.PolicyConfig{
+		Media:          "iso_a4_210x297mm",
+		MediaType:      "stationery",
+		PrintColorMode: "monochrome",
+	}}
+	base := goipp.Attributes{
+		iattr.Keyword("media-supported", "iso_a4_210x297mm"),
+		goipp.MakeAttr("document-format-supported", goipp.TagMimeType, goipp.String("image/pwg-raster")),
+		iattr.Keyword("pwg-raster-document-type-supported", "sgray_8"),
+		goipp.MakeAttribute("pwg-raster-document-resolution-supported", goipp.TagResolution,
+			goipp.Resolution{Xres: 300, Yres: 300, Units: goipp.UnitsDpi}),
+		iattr.Keyword("pwg-raster-document-sheet-back", "normal"),
+	}
+
+	t.Run("resolution requires resolution tag", func(t *testing.T) {
+		upstream := append(goipp.Attributes{}, base...)
+		upstream = iattr.SetAttr(upstream, goipp.MakeAttribute("pwg-raster-document-resolution-supported", goipp.TagInteger,
+			goipp.Resolution{Xres: 300, Yres: 300, Units: goipp.UnitsDpi}))
+		out := FilterPrinterAttributes(upstream, "mono", "ipp://proxy/printers/mono", printer)
+		if _, ok := iattr.Attr(out, "pwg-raster-document-resolution-supported"); ok {
+			t.Fatalf("wrong-tag resolution was advertised: %+v", out)
+		}
+		formats, _ := iattr.Attr(out, "document-format-supported")
+		if hasString(formats, "image/pwg-raster") {
+			t.Fatalf("wrong-tag resolution kept image/pwg-raster: %+v", out)
+		}
+	})
+
+	t.Run("sheet-back requires keyword tag", func(t *testing.T) {
+		upstream := append(goipp.Attributes{}, base...)
+		upstream = iattr.SetAttr(upstream, goipp.MakeAttribute("pwg-raster-document-sheet-back", goipp.TagName, goipp.String("normal")))
+		out := FilterPrinterAttributes(upstream, "mono", "ipp://proxy/printers/mono", printer)
+		if _, ok := iattr.Attr(out, "pwg-raster-document-sheet-back"); ok {
+			t.Fatalf("wrong-tag sheet-back was advertised: %+v", out)
+		}
+		formats, _ := iattr.Attr(out, "document-format-supported")
+		if hasString(formats, "image/pwg-raster") {
+			t.Fatalf("wrong-tag sheet-back kept image/pwg-raster: %+v", out)
+		}
+	})
+}
+
+func TestFilterPrinterAttributesRequiresCompleteURFFamily(t *testing.T) {
+	printer := config.PrinterConfig{Policy: config.PolicyConfig{
+		Media:          "iso_a4_210x297mm",
+		MediaType:      "stationery",
+		PrintColorMode: "monochrome",
+	}}
+	cases := []struct {
+		name   string
+		tokens []string
+		valid  bool
+	}{
+		{
+			name:   "minimal supported family",
+			tokens: []string{"W8-16", "SRGB24", "RS300"},
+			valid:  true,
+		},
+		{
+			name:   "complete AirPrint family",
+			tokens: []string{"V1.4", "W8", "SRGB24", "CP255", "FN3-11", "IS9", "IFU0", "MT1-2", "OB10", "PQ3-4-5", "RS300-600"},
+			valid:  true,
+		},
+		{
+			name:   "missing bit depth",
+			tokens: []string{"SRGB24", "RS300"},
+		},
+		{
+			name:   "missing color space",
+			tokens: []string{"W8", "RS300"},
+		},
+		{
+			name:   "missing resolution",
+			tokens: []string{"W8", "SRGB24"},
+		},
+		{
+			name:   "zero resolution",
+			tokens: []string{"W8", "SRGB24", "RS0"},
+		},
+		{
+			name:   "zero in resolution list",
+			tokens: []string{"W8", "SRGB24", "RS300-0"},
+		},
+		{
+			name:   "zero width",
+			tokens: []string{"W0", "SRGB24", "RS300"},
+		},
+		{
+			name:   "zero color depth",
+			tokens: []string{"W8", "SRGB0", "RS300"},
+		},
+		{
+			name:   "zero required numeric value",
+			tokens: []string{"W8", "SRGB24", "CP0", "RS300"},
+		},
+		{
+			name:   "zero required numeric list member",
+			tokens: []string{"W8", "SRGB24", "FN3-0", "RS300"},
+		},
+		{
+			name:   "zero optional image format values are valid",
+			tokens: []string{"W8", "SRGB24", "IFU0", "OFU0", "RS300"},
+			valid:  true,
+		},
+		{
+			name:   "unknown token",
+			tokens: []string{"W8", "SRGB24", "RS300", "not-urf"},
+		},
+		{
+			name:   "malformed numeric token",
+			tokens: []string{"W8-", "SRGB24", "RS300"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := goipp.Attributes{
+				iattr.Keyword("media-supported", "iso_a4_210x297mm"),
+				goipp.MakeAttr("document-format-supported", goipp.TagMimeType,
+					goipp.String("application/pdf"), goipp.String("image/urf")),
+				iattr.Keywords("urf-supported", tc.tokens...),
+			}
+			out := FilterPrinterAttributes(upstream, "urf", "ipp://proxy/printers/urf", printer)
+			_, advertised := iattr.Attr(out, "urf-supported")
+			formats, _ := iattr.Attr(out, "document-format-supported")
+			urfFormat := hasString(formats, "image/urf")
+			if advertised != tc.valid || urfFormat != tc.valid {
+				t.Fatalf("URF family validity=%t, advertised=%t, image/urf=%t, output=%+v", tc.valid, advertised, urfFormat, out)
+			}
+		})
+	}
+}
+
+func TestFilterPrinterAttributesMediaSourceNilUsesOnlyProvenUpstreamSource(t *testing.T) {
+	printer := config.PrinterConfig{Policy: config.PolicyConfig{
+		Media:          "iso_a4_210x297mm",
+		MediaType:      "stationery",
+		PrintColorMode: "monochrome",
+	}}
+	base := goipp.Attributes{iattr.Keyword("media-supported", "iso_a4_210x297mm")}
+	out := FilterPrinterAttributes(base, "office", "ipp://proxy/printers/office", printer)
+	if _, ok := iattr.Attr(out, "media-source-supported"); ok {
+		t.Fatal("media source was invented without upstream proof")
+	}
+	out = FilterPrinterAttributes(append(base, iattr.Keywords("media-source-supported", "tray-1", "auto")), "office", "ipp://proxy/printers/office", printer)
+	if !iattr.HasStringValue(out, "media-source-supported", "auto") || !iattr.HasStringValue(out, "media-source-default", "auto") {
+		t.Fatalf("proven auto source was not retained: %+v", out)
+	}
+}
+
+func TestCapabilityModelReportsDynamicIPPFeatureEligibility(t *testing.T) {
+	printer := config.PrinterConfig{Policy: config.PolicyConfig{
+		Media:          "iso_a4_210x297mm",
+		MediaType:      "stationery",
+		PrintColorMode: "monochrome",
+	}}
+	claimed := goipp.Attributes{iattr.Keyword("ipp-features-supported", "ipp-everywhere")}
+	model := NewCapabilityModel(claimed, "office", "ipp://proxy/printers/office", printer, CapabilityModelOptions{
+		Operations: []goipp.Op{goipp.OpGetPrinterAttributes},
+	})
+	if !model.IPPEligible || len(model.IPPFeatures) != 2 {
+		t.Fatalf("trusted upstream claim was not advertised: %+v", model)
+	}
+	if len(model.RequiredUnsatisfied) == 0 {
+		t.Fatal("missing required operations were not represented")
+	}
+	if _, ok := iattr.Attr(model.Attributes, "ipp-features-supported"); !ok {
+		t.Fatal("trusted upstream claim was omitted because of local diagnostic gaps")
+	}
+
+	model = NewCapabilityModel(claimed, "office", "ipp://proxy/printers/office", printer, CapabilityModelOptions{Disabled: true})
+	if model.IPPEligible || len(model.IPPFeatures) != 0 {
+		t.Fatalf("disabled model was eligible: %+v", model)
+	}
+	if _, ok := iattr.Attr(model.Attributes, "ipp-features-supported"); ok {
+		t.Fatal("disabled model advertised IPP features")
+	}
+
+	model = NewCapabilityModel(claimed, "office", "ipp://proxy/printers/office", printer, CapabilityModelOptions{})
+	if !model.IPPEligible || len(model.IPPFeatures) != 2 {
+		t.Fatalf("complete default operation set was not eligible: %+v", model)
+	}
+	features, _ := iattr.Attr(model.Attributes, "ipp-features-supported")
+	if !hasString(features, "ipp-everywhere") || !hasString(features, "ipp-everywhere-server") {
+		t.Fatalf("eligible model omitted required features: %+v", features)
+	}
+}
+
+func TestCapabilityModelHonorsPrinterIPPEverywhereDisabledMode(t *testing.T) {
+	printer := config.PrinterConfig{IPPEverywhereMode: config.IPPEverywhereDisabled, Policy: config.PolicyConfig{
+		Media:          "iso_a4_210x297mm",
+		MediaType:      "stationery",
+		PrintColorMode: "monochrome",
+	}}
+	model := NewCapabilityModel(
+		goipp.Attributes{iattr.Keyword("ipp-features-supported", "ipp-everywhere")},
+		"office", "ipp://proxy/printers/office", printer, CapabilityModelOptions{},
+	)
+	if !model.Disabled {
+		t.Fatalf("printer disabled mode was ignored: %+v", model)
+	}
+	if model.IPPEligible || len(model.IPPFeatures) != 0 {
+		t.Fatalf("disabled printer was advertised as IPP Everywhere: %+v", model)
+	}
+	if _, ok := iattr.Attr(model.Attributes, "ipp-features-supported"); ok {
+		t.Fatalf("disabled printer leaked IPP features: %+v", model.Attributes)
+	}
+}
+
+func TestCapabilityModelExplicitEmptyOperationsNeverEmitsEmptyAttribute(t *testing.T) {
+	printer := config.PrinterConfig{Policy: config.PolicyConfig{
+		Media:          "iso_a4_210x297mm",
+		MediaType:      "stationery",
+		PrintColorMode: "monochrome",
+	}}
+	model := NewCapabilityModel(
+		goipp.Attributes{iattr.Keyword("ipp-features-supported", "ipp-everywhere")},
+		"office", "ipp://proxy/printers/office", printer,
+		CapabilityModelOptions{Operations: []goipp.Op{}},
+	)
+	if !model.Disabled {
+		t.Fatalf("empty operation surface did not deactivate model: %+v", model)
+	}
+	if model.IPPEligible || len(model.IPPFeatures) != 0 {
+		t.Fatalf("empty operation surface advertised IPP Everywhere: %+v", model)
+	}
+	attr, ok := iattr.Attr(model.Attributes, "operations-supported")
+	if !ok || len(attr.Values) == 0 {
+		t.Fatalf("operations-supported was empty or missing: %+v", model.Attributes)
+	}
+}
+
+func TestFilterPrinterAttributesAcceptsSpecValidPWGRasterTypes(t *testing.T) {
+	printer := config.PrinterConfig{Policy: config.PolicyConfig{
+		Media:          "iso_a4_210x297mm",
+		MediaType:      "stationery",
+		PrintColorMode: "color",
+	}}
+	upstream := goipp.Attributes{
+		iattr.Keyword("media-supported", "iso_a4_210x297mm"),
+		goipp.MakeAttr("document-format-supported", goipp.TagMimeType, goipp.String("image/pwg-raster")),
+		iattr.Keywords("pwg-raster-document-type-supported", "cmyk_8", "device1_8", "srgb_8", "sgray_8"),
+		goipp.MakeAttribute("pwg-raster-document-resolution-supported", goipp.TagResolution,
+			goipp.Resolution{Xres: 300, Yres: 300, Units: goipp.UnitsDpi}),
+		iattr.Keyword("pwg-raster-document-sheet-back", "manual-tumble"),
+	}
+	out := FilterPrinterAttributes(upstream, "color", "ipp://proxy/printers/color", printer)
+	for _, rasterType := range []string{"cmyk_8", "device1_8", "srgb_8"} {
+		if !iattr.HasStringValue(out, "pwg-raster-document-type-supported", rasterType) {
+			t.Fatalf("valid color PWG Raster type %q was filtered: %+v", rasterType, out)
+		}
+	}
+	if iattr.HasStringValue(out, "pwg-raster-document-type-supported", "sgray_8") {
+		t.Fatal("monochrome PWG Raster type leaked into color capabilities")
+	}
+	if !iattr.HasStringValue(out, "pwg-raster-document-sheet-back", "manual-tumble") {
+		t.Fatalf("manual-tumble sheet-back was filtered: %+v", out)
+	}
+}
+
+func TestMediaSizeFromPWGNameRejectsUnsafeRoundedDimensions(t *testing.T) {
+	for _, name := range []string{
+		"tiny_0.001x1mm",
+		"huge_9223372036854775808x1mm",
+		"huge_100000000000000000000x1in",
+	} {
+		if _, ok := mediaSizeFromPWGName(name); ok {
+			t.Fatalf("unsafe media dimensions were accepted: %q", name)
+		}
+	}
+	parsed, ok := mediaSizeFromPWGName("safe_0.01x1mm")
+	if !ok || parsed.XDimension != 1 || parsed.YDimension != 100 {
+		t.Fatalf("valid rounded media dimensions were rejected or changed: %+v, ok=%t", parsed, ok)
 	}
 }
 

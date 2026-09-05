@@ -42,6 +42,148 @@ type NormalizationLog struct {
 	ForcedPrintColorMode string
 }
 
+type FidelityMode string
+
+const (
+	FidelityWarn   FidelityMode = "warn"
+	FidelityReject FidelityMode = "reject"
+)
+
+type NormalizationOptions struct {
+	Policy           config.PolicyConfig
+	Upstream         goipp.Attributes
+	DropVendorAttrs  []string
+	PreserveJobAttrs []string
+	Fidelity         bool
+	FidelityMode     FidelityMode
+}
+
+type NormalizationResult struct {
+	Attrs         goipp.Attributes
+	Log           NormalizationLog
+	Unsupported   goipp.Attributes
+	Substitutions []string
+	Substituted   bool
+}
+
+type NormalizationError struct {
+	Status      goipp.Status
+	Message     string
+	Unsupported goipp.Attributes
+}
+
+func (e *NormalizationError) Error() string { return e.Message }
+
+// NormalizeJobAttrsWithOptions is the policy boundary used by the protocol
+// processor. It distinguishes invalid syntax from a valid value that policy
+// substitutes and applies preserve_job_attrs as an authoritative allowlist.
+func NormalizeJobAttrsWithOptions(attrs goipp.Attributes, options NormalizationOptions) (NormalizationResult, error) {
+	if options.FidelityMode == "" {
+		options.FidelityMode = FidelityWarn
+	}
+	if options.FidelityMode != FidelityWarn && options.FidelityMode != FidelityReject {
+		return NormalizationResult{}, &NormalizationError{Status: goipp.StatusErrorBadRequest, Message: "invalid fidelity mode"}
+	}
+	if invalid := malformedPolicyAttributes(attrs); len(invalid) > 0 {
+		return NormalizationResult{}, &NormalizationError{Status: goipp.StatusErrorAttributesOrValues, Message: "malformed policy-controlled attribute", Unsupported: invalid}
+	}
+
+	preserve := make(map[string]struct{}, len(options.PreserveJobAttrs))
+	for _, name := range options.PreserveJobAttrs {
+		preserve[strings.ToLower(strings.TrimSpace(name))] = struct{}{}
+	}
+	policyNames := make(map[string]struct{}, len(policyDropAttrs)+len(options.DropVendorAttrs))
+	for _, name := range policyDropAttrs {
+		policyNames[strings.ToLower(name)] = struct{}{}
+	}
+	for _, name := range options.DropVendorAttrs {
+		policyNames[strings.ToLower(name)] = struct{}{}
+	}
+	input := make(goipp.Attributes, 0, len(attrs))
+	var unsupported goipp.Attributes
+	for _, attr := range attrs {
+		name := strings.ToLower(attr.Name)
+		if _, controlled := policyNames[name]; controlled {
+			input = append(input, attr)
+			continue
+		}
+		if _, allowed := preserve[name]; allowed {
+			input = append(input, attr)
+			continue
+		}
+		unsupported = append(unsupported, attr)
+	}
+	if options.Fidelity && len(unsupported) > 0 {
+		return NormalizationResult{}, &NormalizationError{Status: goipp.StatusErrorAttributesOrValues, Message: "unsupported job-template attributes", Unsupported: unsupported}
+	}
+
+	normalized, log := NormalizeJobAttrsWithCapabilities(input, options.Policy, options.DropVendorAttrs, options.Upstream)
+	result := NormalizationResult{Attrs: normalized, Log: log, Unsupported: unsupported, Substituted: len(unsupported) > 0}
+	for _, attr := range unsupported {
+		result.Substitutions = append(result.Substitutions, attr.Name)
+	}
+	addSubstitution := func(name string, attr goipp.Attribute, present bool) {
+		if !present {
+			return
+		}
+		result.Substituted = true
+		result.Substitutions = append(result.Substitutions, name)
+		result.Unsupported = append(result.Unsupported, attr)
+	}
+	if attr, present := iattr.Attr(attrs, "media"); present {
+		addSubstitution("media", attr, log.MediaFallback || !iattr.HasStringValue(normalized, "media", log.ClientMedia))
+	}
+	if attr, present := iattr.Attr(attrs, "media-col"); present {
+		addSubstitution("media-col", attr, log.MediaFallback || !options.Policy.UseMediaCol)
+	}
+	for _, rule := range []struct {
+		name string
+		want string
+	}{
+		{"media-type", options.Policy.MediaType},
+		{"media-source", policyMediaSource(options.Policy)},
+		{"print-color-mode", options.Policy.PrintColorMode},
+		{"output-mode", options.Policy.PrintColorMode},
+	} {
+		if attr, present := iattr.Attr(attrs, rule.name); present {
+			got, _ := iattr.FirstString(attrs, rule.name)
+			addSubstitution(rule.name, attr, !strings.EqualFold(strings.TrimSpace(got), strings.TrimSpace(rule.want)))
+		}
+	}
+	for _, name := range options.DropVendorAttrs {
+		if attr, present := iattr.Attr(attrs, name); present {
+			addSubstitution(attr.Name, attr, true)
+		}
+	}
+	if options.Fidelity && options.FidelityMode == FidelityReject && result.Substituted {
+		return NormalizationResult{}, &NormalizationError{Status: goipp.StatusErrorAttributesOrValues, Message: "job attributes conflict with queue policy", Unsupported: result.Unsupported}
+	}
+	return result, nil
+}
+
+func malformedPolicyAttributes(attrs goipp.Attributes) goipp.Attributes {
+	var invalid goipp.Attributes
+	for _, attr := range attrs {
+		name := strings.ToLower(attr.Name)
+		switch name {
+		case "media", "media-type", "media-source", "print-color-mode", "output-mode":
+			if len(attr.Values) != 1 || attr.Values[0].T != goipp.TagKeyword {
+				invalid = append(invalid, attr)
+				continue
+			}
+			value, ok := attr.Values[0].V.(goipp.String)
+			if !ok || strings.TrimSpace(string(value)) == "" {
+				invalid = append(invalid, attr)
+			}
+		case "media-col":
+			if len(attr.Values) != 1 || attr.Values[0].T != goipp.TagBeginCollection || !validMediaColSyntax(attr) {
+				invalid = append(invalid, attr)
+			}
+		}
+	}
+	return invalid
+}
+
 // NormalizeJobAttrs keeps the original API and resolves standard PWG media
 // names without requiring a prior capability probe. Service request paths use
 // NormalizeJobAttrsWithCapabilities so custom printer media names can also be
