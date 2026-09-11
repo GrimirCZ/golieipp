@@ -24,6 +24,8 @@ const (
 
 	avahiInterfaceUnspec  = int32(-1)
 	avahiProtocolUnspec   = int32(-1)
+	avahiGroupUncommitted = int32(0)
+	avahiGroupRegistering = int32(1)
 	avahiGroupEstablished = int32(2)
 	avahiGroupCollision   = int32(3)
 	avahiGroupFailure     = int32(4)
@@ -223,6 +225,66 @@ func (p *avahiPublisher) Withdraw(ctx context.Context) (Status, error) {
 	p.group = ""
 	p.current = nil
 	return Status{State: StateWithdrawn, Name: name}, nil
+}
+
+func (p *avahiPublisher) DebugState() DebugState {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	availability := "not_connected"
+	if p.closed {
+		availability = "closed"
+	} else if p.conn != nil {
+		availability = "disconnected"
+		if p.conn.Connected() {
+			availability = "connected"
+		}
+	}
+	state := DebugState{
+		Backend:         "avahi",
+		Availability:    availability,
+		EntryGroup:      string(p.group),
+		EntryGroupState: "not_created",
+		Closed:          p.closed,
+	}
+	if p.group != "" {
+		state.EntryGroupState = "unknown"
+		if p.conn == nil {
+			state.EntryGroupStateErr = "Avahi connection is unavailable"
+		} else {
+			ctx, cancel := context.WithTimeout(context.Background(), avahiCleanupTimeout)
+			var groupState int32
+			err := p.conn.Object(avahiBusName, p.group).CallWithContext(ctx, avahiEntryGroupInt+".GetState", 0).Store(&groupState)
+			cancel()
+			if err != nil {
+				state.EntryGroupStateErr = err.Error()
+			} else {
+				state.EntryGroupState = avahiGroupStateName(groupState)
+			}
+		}
+	}
+	if p.current != nil {
+		state.HasPublication = true
+		state.Publication = *clonePublication(p.current)
+	}
+	return state
+}
+
+func avahiGroupStateName(state int32) string {
+	switch state {
+	case avahiGroupUncommitted:
+		return "uncommitted"
+	case avahiGroupRegistering:
+		return "registering"
+	case avahiGroupEstablished:
+		return "established"
+	case avahiGroupCollision:
+		return "collision"
+	case avahiGroupFailure:
+		return "failure"
+	default:
+		return fmt.Sprintf("unknown(%d)", state)
+	}
 }
 
 func (p *avahiPublisher) Close() error {

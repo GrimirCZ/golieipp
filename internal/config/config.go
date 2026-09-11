@@ -447,7 +447,7 @@ func (c *Config) Validate() error {
 	if c.Listen.PublicBaseURL == "" {
 		return errors.New("listen.public_base_url is required")
 	}
-	if err := validateIPPURI(c.Listen.PublicBaseURL); err != nil {
+	if err := validatePublicIPPURI(c.Listen.PublicBaseURL); err != nil {
 		return fmt.Errorf("listen.public_base_url: %w", err)
 	}
 	if c.limitsAliasConflict {
@@ -724,6 +724,27 @@ func validateIPPURI(raw string) error {
 	}
 	if u.Fragment != "" {
 		return errors.New("must not contain a fragment")
+	}
+	return nil
+}
+
+// validatePublicIPPURI validates the URI exposed to clients. The upstream URI
+// may use IPPS, but the public listener is intentionally plaintext-only until
+// the application has a TLS listener and certificate configuration.
+func validatePublicIPPURI(raw string) error {
+	if err := validateIPPURI(raw); err != nil {
+		return err
+	}
+	u, _ := url.Parse(raw)
+	if !strings.EqualFold(u.Scheme, "ipp") {
+		return errors.New("public endpoint must use ipp; ipps is not supported yet")
+	}
+	if u.RawQuery != "" {
+		return errors.New("public endpoint must not contain a query")
+	}
+	basePath := strings.TrimRight(u.EscapedPath(), "/")
+	if basePath != "/printers" && basePath != "/ipp" {
+		return errors.New("public endpoint path must be /printers or /ipp")
 	}
 	return nil
 }

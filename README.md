@@ -19,9 +19,28 @@ go run ./cmd/golieipp -config config.yaml -debug
 Debug logs are structured JSON and include request correlation IDs, IPP operation/request IDs, upstream HTTP status, upstream IPP status, and timing. Document payload bytes are not logged.
 
 `GET /healthz` is process liveness. `GET /readyz` returns JSON for every queue,
-including active/stale state, the last refresh error, IPP Everywhere eligibility,
-and DNS-SD degradation. A required inactive queue makes readiness return 503;
-an inactive optional queue or a stale last-known-good snapshot does not.
+including active/stale state, the last refresh error, and IPP Everywhere
+eligibility. Linux `avahi` builds also include a small top-level `mdns.state`
+summary; detailed registrations are never exposed there. A required inactive
+queue makes readiness return 503; an inactive optional queue, a stale
+last-known-good snapshot, or mDNS degradation does not.
+
+On Unix, request an on-demand local diagnostic snapshot with `SIGUSR1`:
+
+```sh
+kill -USR1 "$(pidof golieipp)"
+# systemd: sudo systemctl kill --signal=USR1 golieipp
+# Docker:  docker kill --signal=USR1 golieipp
+```
+
+The structured logs contain the effective redacted configuration, application
+and queue lifecycle state, capability snapshots, job-registry aggregates, and
+all diagnostic sections compiled into the binary. Linux `avahi` builds add the
+complete proxy-owned mDNS registration/TXT snapshot, including the publisher
+and entry-group state. Upstream URI credentials are redacted and document
+payload bytes are never logged. The mDNS section describes this process's
+registrations; it does not enumerate unrelated Avahi clients or prove that an
+iPhone received multicast traffic.
 
 Dump the raw capabilities of every configured upstream printer without starting
 the proxy or opening its SQLite job store:
@@ -115,7 +134,9 @@ file. To publish through the host Avahi daemon, the deployment must deliberately
 expose the system D-Bus socket, grant an Avahi/D-Bus policy to the container
 user, and allow mDNS multicast (UDP 5353) on the selected network. Those are
 host-specific security decisions; do not mount the system bus broadly without
-a restrictive policy. Direct `ipp://`/`ipps://` queue URLs work without them.
+a restrictive policy. Direct `ipp://` queue URLs work without them. Public
+IPPS/TLS endpoints are not supported yet; an upstream printer may still use an
+`ipps://` URI.
 
 Check service status and logs:
 

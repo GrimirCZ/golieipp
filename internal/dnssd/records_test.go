@@ -3,6 +3,7 @@ package dnssd
 import (
 	"context"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -22,13 +23,17 @@ func TestBuildRecordsIncludesIPPAndLegacyServices(t *testing.T) {
 	want := []ServiceRecord{
 		{Name: "Office Printer", Hostname: "proxy.example.test", Port: 8631, Type: "_ipp._tcp", TXT: map[string]string{"product": "golieipp", "ty": "Office"}},
 		{Name: "Office Printer", Hostname: "proxy.example.test", Port: 8631, Type: "_ipp._tcp", Subtype: "_print"},
+		{Name: "Office Printer", Hostname: "proxy.example.test", Port: 8631, Type: "_ipp._tcp", Subtype: "_universal"},
 		{Name: "Office Printer", Hostname: "proxy.example.test", Port: 0, Type: "_printer._tcp"},
 	}
 	if !reflect.DeepEqual(records, want) {
 		t.Fatalf("records = %#v, want %#v", records, want)
 	}
 	if got := records[1].FullType(); got != "_print._sub._ipp._tcp" {
-		t.Fatalf("subtype service type = %q", got)
+		t.Fatalf("print subtype service type = %q", got)
+	}
+	if got := records[2].FullType(); got != "_universal._sub._ipp._tcp" {
+		t.Fatalf("universal subtype service type = %q", got)
 	}
 }
 
@@ -49,15 +54,17 @@ func TestBuildRecordsIncludesIPPSVariantsWhenRequested(t *testing.T) {
 	want := []string{
 		"_ipp._tcp",
 		"_print._sub._ipp._tcp",
+		"_universal._sub._ipp._tcp",
 		"_printer._tcp",
 		"_ipps._tcp",
 		"_print._sub._ipps._tcp",
+		"_universal._sub._ipps._tcp",
 	}
 	if !reflect.DeepEqual(types, want) {
 		t.Fatalf("service types = %#v, want %#v", types, want)
 	}
-	if records[2].Port != 0 {
-		t.Fatalf("legacy service port = %d, want 0", records[2].Port)
+	if records[3].Port != 0 {
+		t.Fatalf("legacy service port = %d, want 0", records[3].Port)
 	}
 }
 
@@ -70,6 +77,53 @@ func TestBuildRecordsRejectsInvalidInput(t *testing.T) {
 		if _, err := BuildRecords(input); err == nil {
 			t.Fatalf("BuildRecords(%+v) unexpectedly succeeded", input)
 		}
+	}
+}
+
+func TestTXTEntriesPrioritizeRoutingAndVersionKeys(t *testing.T) {
+	entries := TXTEntries(map[string]string{
+		"product": "golieipp",
+		"URF":     "V1.5,W8,SRGB24,RS600",
+		"pdl":     "application/pdf",
+		"rp":      "printers/office",
+		"qtotal":  "1",
+		"txtvers": "1",
+	})
+	want := []string{
+		"rp=printers/office",
+		"txtvers=1",
+		"qtotal=1",
+		"product=golieipp",
+		"pdl=application/pdf",
+		"URF=V1.5,W8,SRGB24,RS600",
+	}
+	if len(entries) != len(want) {
+		t.Fatalf("TXT entry count = %d, want %d: %#v", len(entries), len(want), entries)
+	}
+	for index := range want {
+		if entries[index] != want[index] {
+			t.Fatalf("TXT entry %d = %q, want %q", index, entries[index], want[index])
+		}
+	}
+}
+
+func TestBuildRecordsRejectsOversizedTXTData(t *testing.T) {
+	longValue := strings.Repeat("x", 240)
+	records, err := BuildRecords(ServiceInput{
+		Name:     "Office Printer",
+		Hostname: "proxy.example.test",
+		Port:     8631,
+		TXT: map[string]string{
+			"pdl":      longValue,
+			"URF":      longValue,
+			"product":  longValue,
+			"note":     longValue,
+			"adminurl": longValue,
+			"ty":       longValue,
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "exceeds 1300") || records != nil {
+		t.Fatalf("oversized TXT data was accepted: records=%#v err=%v", records, err)
 	}
 }
 

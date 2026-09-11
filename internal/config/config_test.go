@@ -148,7 +148,7 @@ printers:
 func TestLoadAppliesDNSDefaultsAndPreservesExplicitFalse(t *testing.T) {
 	cfg := loadConfigYAML(t, `
 listen:
-  public_base_url: "ipps://proxy.example/printers"
+  public_base_url: "ipp://proxy.example/printers"
 printers:
   default:
     upstream_uri: "ipp://printer.example/ipp/print"
@@ -276,6 +276,10 @@ func TestLoadRejectsInvalidURIsEnumsKeywordsAndRanges(t *testing.T) {
 	}{
 		{name: "public URI", body: `listen:
   public_base_url: "http://proxy.example/printers"`, want: "listen.public_base_url"},
+		{name: "public IPPS URI", body: `listen:
+  public_base_url: "ipps://proxy.example/printers"`, want: "listen.public_base_url"},
+		{name: "public path", body: `listen:
+  public_base_url: "ipp://proxy.example/queues"`, want: "listen.public_base_url"},
 		{name: "upstream URI", body: `listen:
   public_base_url: "ipp://proxy.example/printers"
 printers:

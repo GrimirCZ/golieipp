@@ -905,10 +905,9 @@ func synthesizePrinterAttributes(model CapabilityModel) goipp.Attributes {
 		iattr.Text("printer-info", fmt.Sprintf("%s via policy proxy", printer.DisplayName)),
 		iattr.Text("printer-location", printer.Location),
 	)
+	// The public listener is intentionally plaintext-only until TLS support is
+	// implemented end-to-end. Upstream IPPS remains supported independently.
 	security := "none"
-	if strings.HasPrefix(strings.ToLower(proxyURI), "ipps://") {
-		security = "tls"
-	}
 	for _, owned := range (goipp.Attributes{
 		iattr.Keywords("ipp-versions-supported", "1.0", "1.1", "2.0"),
 		iattr.Keyword("uri-authentication-supported", "none"),

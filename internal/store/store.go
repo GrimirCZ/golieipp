@@ -121,6 +121,15 @@ type Job struct {
 	NextReconcileAt      *time.Time
 }
 
+// JobSummary contains aggregate registry state for diagnostics. It omits job
+// names, users, and document contents so an operator dump can describe queue
+// pressure and lifecycle state without becoming a job-data export.
+type JobSummary struct {
+	Total   int
+	ByQueue map[string]int
+	ByState map[string]int
+}
+
 // JobFilter describes the server-side filters needed by Get-Jobs and
 // Cancel-My-Jobs in addition to administrative listing and reconciliation.
 // Zero values mean no restriction.
@@ -1019,6 +1028,41 @@ func (s *Store) ListJobs(ctx context.Context, args ...any) ([]Job, error) {
 		return nil, err
 	}
 	return jobs, nil
+}
+
+// SummarizeJobs returns bounded aggregate state without loading every job row
+// into memory. It is used by diagnostic reporting and intentionally contains
+// no document payload or per-user metadata.
+func (s *Store) SummarizeJobs(ctx context.Context) (JobSummary, error) {
+	if s == nil || s.db == nil {
+		return JobSummary{}, errors.New("job store is unavailable")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT queue, state, COUNT(*) FROM jobs GROUP BY queue, state ORDER BY queue, state`)
+	if err != nil {
+		return JobSummary{}, err
+	}
+	defer rows.Close()
+	summary := JobSummary{
+		ByQueue: make(map[string]int),
+		ByState: make(map[string]int),
+	}
+	for rows.Next() {
+		var queue, state string
+		var count int
+		if err := rows.Scan(&queue, &state, &count); err != nil {
+			return JobSummary{}, err
+		}
+		summary.Total += count
+		summary.ByQueue[queue] += count
+		summary.ByState[state] += count
+	}
+	if err := rows.Err(); err != nil {
+		return JobSummary{}, err
+	}
+	return summary, nil
 }
 
 func (s *Store) List(ctx context.Context, args ...any) ([]Job, error) {

@@ -60,9 +60,10 @@ func (r ServiceRecord) FullType() string {
 }
 
 // BuildRecords returns the registrations required for an IPP Everywhere
-// queue. The legacy _printer._tcp registration intentionally uses port zero;
-// this preserves discovery by older clients without advertising a second
-// transport endpoint.
+// queue. The _universal subtype is used by AirPrint clients, while _print and
+// the legacy _printer._tcp registration preserve discovery by other clients.
+// The legacy registration intentionally uses port zero so it does not
+// advertise a second transport endpoint.
 func BuildRecords(input ServiceInput) ([]ServiceRecord, error) {
 	if err := validateServiceInput(input); err != nil {
 		return nil, err
@@ -71,12 +72,14 @@ func BuildRecords(input ServiceInput) ([]ServiceRecord, error) {
 	ipp := []ServiceRecord{
 		{Name: input.Name, Hostname: input.Hostname, Port: input.Port, Type: "_ipp._tcp", TXT: cloneTXT(txt), GeoLocation: input.GeoLocation},
 		{Name: input.Name, Hostname: input.Hostname, Port: input.Port, Type: "_ipp._tcp", Subtype: "_print"},
+		{Name: input.Name, Hostname: input.Hostname, Port: input.Port, Type: "_ipp._tcp", Subtype: "_universal"},
 		{Name: input.Name, Hostname: input.Hostname, Port: 0, Type: "_printer._tcp"},
 	}
 	if input.IPPS {
 		ipp = append(ipp,
 			ServiceRecord{Name: input.Name, Hostname: input.Hostname, Port: input.Port, Type: "_ipps._tcp", TXT: cloneTXT(txt)},
 			ServiceRecord{Name: input.Name, Hostname: input.Hostname, Port: input.Port, Type: "_ipps._tcp", Subtype: "_print"},
+			ServiceRecord{Name: input.Name, Hostname: input.Hostname, Port: input.Port, Type: "_ipps._tcp", Subtype: "_universal"},
 		)
 	}
 	return ipp, nil
@@ -113,6 +116,54 @@ func validateServiceInput(input ServiceInput) error {
 		if strings.IndexFunc(key, func(r rune) bool { return unicode.IsControl(r) }) >= 0 || strings.IndexFunc(value, func(r rune) bool { return unicode.IsControl(r) }) >= 0 {
 			return fmt.Errorf("TXT entry %q contains a control character", key)
 		}
+	}
+	if err := validateTXTSize(input.TXT); err != nil {
+		return err
+	}
+	return nil
+}
+
+const (
+	maxTXTEntryBytes = 255
+	maxTXTDataBytes  = 1300
+	maxRPBytes       = 400
+)
+
+var txtKeyOrder = []string{
+	"rp", "txtvers", "qtotal", "priority", "note", "air", "tls",
+	"adminurl", "uuid", "duuid", "ty", "color", "duplex", "copies", "collate",
+	"papermax", "papercustom", "bind", "punch", "sort", "staple", "product", "pdl", "urf",
+}
+
+func txtKeyPriority(key string) int {
+	key = strings.ToLower(key)
+	for index, preferred := range txtKeyOrder {
+		if key == preferred {
+			return index
+		}
+	}
+	return len(txtKeyOrder)
+}
+
+func validateTXTSize(txt map[string]string) error {
+	entries := TXTEntries(txt)
+	total := 0
+	rpEnd := 0
+	for _, entry := range entries {
+		entryBytes := len([]byte(entry))
+		if entryBytes > maxTXTEntryBytes {
+			return fmt.Errorf("TXT entry exceeds %d bytes", maxTXTEntryBytes)
+		}
+		total += 1 + entryBytes // one length byte precedes each DNS-SD string.
+		if strings.HasPrefix(strings.ToLower(entry), "rp=") && rpEnd == 0 {
+			rpEnd = total
+		}
+	}
+	if total > maxTXTDataBytes {
+		return fmt.Errorf("TXT data exceeds %d bytes", maxTXTDataBytes)
+	}
+	if rpEnd > maxRPBytes {
+		return fmt.Errorf("TXT rp entry must occur within the first %d bytes", maxRPBytes)
 	}
 	return nil
 }
@@ -197,14 +248,25 @@ func cloneTXT(txt map[string]string) map[string]string {
 }
 
 // TXTEntries converts caller-owned key/value TXT data to deterministic
-// key=value strings. Sorting makes DBus calls and tests stable.
+// key=value strings. Routing and version keys are deliberately prioritized so
+// clients can find rp within the early portion of the DNS-SD TXT payload.
 func TXTEntries(txt map[string]string) []string {
 	entries := make([]string, 0, len(txt))
 	keys := make([]string, 0, len(txt))
 	for key := range txt {
 		keys = append(keys, key)
 	}
-	sort.Strings(keys)
+	sort.Slice(keys, func(i, j int) bool {
+		leftPriority, rightPriority := txtKeyPriority(keys[i]), txtKeyPriority(keys[j])
+		if leftPriority != rightPriority {
+			return leftPriority < rightPriority
+		}
+		left, right := strings.ToLower(keys[i]), strings.ToLower(keys[j])
+		if left != right {
+			return left < right
+		}
+		return keys[i] < keys[j]
+	})
 	for _, key := range keys {
 		entries = append(entries, key+"="+txt[key])
 	}

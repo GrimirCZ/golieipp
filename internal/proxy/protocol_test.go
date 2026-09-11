@@ -26,6 +26,9 @@ func TestProtocolProcessorValidatesEnvelopeAndTarget(t *testing.T) {
 		{name: "wrong queue target", hasPayload: true, status: goipp.StatusErrorNotFound, mutate: func(m *goipp.Message) {
 			m.Operation = iattr.SetAttr(m.Operation, iattr.URI("printer-uri", "ipp://proxy.example/printers/other"))
 		}},
+		{name: "discovered host and explicit default port", hasPayload: true, mutate: func(m *goipp.Message) {
+			m.Operation = iattr.SetAttr(m.Operation, iattr.URI("printer-uri", "ipp://proxy.local:631/printers/office"))
+		}},
 		{name: "duplicate operation attribute", hasPayload: true, status: goipp.StatusErrorBadRequest, mutate: func(m *goipp.Message) {
 			m.Operation = append(m.Operation, iattr.URI("printer-uri", printerURI))
 		}},
@@ -239,8 +242,15 @@ func TestProtocolProcessorRequiresSendDocumentLastDocumentAndValidOverride(t *te
 	}
 }
 
-func TestProtocolProcessorRequiresCanonicalJobURI(t *testing.T) {
+func TestProtocolProcessorRequiresMatchingJobPath(t *testing.T) {
 	printerURI := "ipp://proxy.example/printers/office"
+	valid := goipp.NewRequest(goipp.DefaultVersion, goipp.OpGetJobAttributes, 57)
+	valid.Operation = append(iattr.BasicOperationAttrs(""), iattr.URI("job-uri", "ipp://proxy.local:8631/printers/office/jobs/4"))
+	valid.Operation = iattr.DropAttrs(valid.Operation, "printer-uri")
+	if err := ValidateProtocolRequest(valid, printerURI, false); err != nil {
+		t.Fatalf("job URI with a discovered host was rejected: %v", err)
+	}
+
 	for _, raw := range []string{
 		printerURI + "/jobs/4/extra/5",
 		printerURI + "/jobs/4?redirect=1",
@@ -250,7 +260,7 @@ func TestProtocolProcessorRequiresCanonicalJobURI(t *testing.T) {
 		msg.Operation = append(iattr.BasicOperationAttrs(""), iattr.URI("job-uri", raw))
 		msg.Operation = iattr.DropAttrs(msg.Operation, "printer-uri")
 		if err := ValidateProtocolRequest(msg, printerURI, false); err == nil || err.Status != goipp.StatusErrorNotFound {
-			t.Fatalf("non-canonical job URI %q accepted: %#v", raw, err)
+			t.Fatalf("job URI with a non-matching path %q accepted: %#v", raw, err)
 		}
 	}
 }

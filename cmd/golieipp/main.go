@@ -70,6 +70,8 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	stopDiagnosticSignal := installDiagnosticSignal(ctx, svc, logger)
+	defer stopDiagnosticSignal()
 
 	if err := svc.RefreshAll(ctx); err != nil {
 		logger.Error("refresh upstream capabilities", "error", err)

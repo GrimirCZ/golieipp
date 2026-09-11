@@ -8,12 +8,16 @@ import (
 	iattr "github.com/grimir/golieipp/internal/ipp"
 )
 
-func printerDNSSDTXT(resourcePath, name, location string, attrs goipp.Attributes, ipps bool) map[string]string {
+func printerDNSSDTXT(resourcePath, name, location string, attrs goipp.Attributes) map[string]string {
+	model := name
+	if upstreamModel, ok := iattr.FirstString(attrs, "printer-make-and-model"); ok && strings.TrimSpace(upstreamModel) != "" {
+		model = upstreamModel
+	}
 	txt := map[string]string{
 		"txtvers": "1",
 		"qtotal":  "1",
 		"rp":      strings.TrimLeft(resourcePath, "/"),
-		"ty":      name,
+		"ty":      model,
 	}
 	if location != "" {
 		txt["note"] = location
@@ -47,9 +51,6 @@ func printerDNSSDTXT(resourcePath, name, location string, attrs goipp.Attributes
 	}
 	if urf := stringValues(attrs, "urf-supported"); len(urf) > 0 {
 		txt["URF"] = strings.Join(urf, ",")
-	}
-	if ipps {
-		txt["TLS"] = "1.2"
 	}
 	return txt
 }

@@ -52,6 +52,39 @@ func TestStoreCreateAndLookupJob(t *testing.T) {
 	}
 }
 
+func TestStoreSummarizeJobsAggregatesQueueAndLifecycleState(t *testing.T) {
+	s, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	for _, job := range []Job{
+		{Queue: "office", State: StateReserved},
+		{Queue: "office", State: StateUncertain},
+		{Queue: "home", State: StateTerminal},
+	} {
+		if _, err := s.CreateJob(ctx, job); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	summary, err := s.SummarizeJobs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Total != 3 {
+		t.Fatalf("total jobs = %d, want 3", summary.Total)
+	}
+	if summary.ByQueue["office"] != 2 || summary.ByQueue["home"] != 1 {
+		t.Fatalf("jobs by queue = %#v", summary.ByQueue)
+	}
+	if summary.ByState[StateReserved] != 1 || summary.ByState[StateUncertain] != 1 || summary.ByState[StateTerminal] != 1 {
+		t.Fatalf("jobs by state = %#v", summary.ByState)
+	}
+}
+
 func TestStoreUpdatePayloadMetadataAddsDocumentCounters(t *testing.T) {
 	s, err := Open(":memory:")
 	if err != nil {

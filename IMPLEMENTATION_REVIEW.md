@@ -174,7 +174,9 @@ active.
 
 - `/healthz`: process liveness.
 - `/readyz`: JSON overall/per-queue readiness, optional/active/stale fields,
-  last success/error, IPP Everywhere eligibility, and DNS-SD status/name.
+  last success/error, and IPP Everywhere eligibility. Linux `avahi` builds add
+  only a small aggregate `mdns.state` entry; detailed mDNS state is available
+  through the signal diagnostic dump.
 - A required inactive queue returns 503; an inactive optional queue does not.
 - Defaults: 1 MiB envelope, 1 GiB document, 32 MiB upstream response, two
   concurrent payload submissions per queue, and 30-day terminal retention.
@@ -187,6 +189,14 @@ active.
 ### Transport and diagnostics
 
 - `ipp`/`ipps` URIs without a port use port 631.
+- The public listener currently supports plaintext `ipp://` only. Public IPPS
+  and TLS advertisement are deferred until the proxy has an end-to-end TLS
+  listener and certificate configuration; upstream printers may still use
+  `ipps://`.
+- Client printer and job targets are matched by absolute URI scheme and
+  resource path. Host and port are intentionally ignored after HTTP routing,
+  because DNS-SD supplies the client-facing authority and may use an alias or
+  an explicit/default port; query strings and fragments remain invalid.
 - Redirects are not followed.
 - The upstream must return HTTP 200 and `application/ipp`.
 - Response version is negotiated against the request; request ID, response
@@ -218,12 +228,17 @@ printers:
 ```
 
 Linux builds with the `avahi` tag use the system D-Bus Avahi API. Other builds
-use the stub. Eligible queues publish `_ipp._tcp`, the `_print` subtype, and
-legacy `_printer._tcp` on port zero; IPPS endpoints also publish IPPS records.
+use the stub. Eligible queues publish plaintext `_ipp._tcp`, the `_print` and
+`_universal` subtypes, and legacy `_printer._tcp` on port zero. Public IPPS
+publication is deferred until the proxy has a TLS listener and certificate
+configuration.
 TXT is synthesized only from filtered proxy capabilities and excludes
-`application/octet-stream`. Publication uses bounded collision names and
-retries, updates entry groups, records the actual DNS-SD name, and withdraws on
-shutdown or lost eligibility. A valid upstream `printer-geo-location` wins;
+`application/octet-stream` from `pdl` (the IPP format list may still retain it
+for ordinary IPP clients). Entries use the PWG priority order, keep `rp` in the
+first 400 bytes, and enforce the per-entry and multicast aggregate limits.
+Publication uses bounded collision names and retries, updates entry groups,
+records the actual DNS-SD name, and withdraws on shutdown or lost eligibility.
+A valid upstream `printer-geo-location` wins;
 the per-queue override is the fallback for a LOC record. TXT capability updates
 are applied to the existing Avahi entry group; endpoint/interface/LOC changes
 require a proxy restart so a failed refresh cannot destroy the last good
@@ -232,6 +247,18 @@ structural publication.
 The official Linux Make target and Docker build enable `avahi`. The default
 Compose file intentionally does not mount the host system bus; deployments must
 make an explicit D-Bus policy and multicast-networking decision.
+
+`SIGUSR1` requests a structured application diagnostic dump. Diagnostic output
+is assembled through compile-time diagnostic plugins: the common application
+plugin emits effective redacted configuration, queue/capability state, and job
+registry aggregates, while the `linux && avahi` build adds the complete
+proxy-owned publisher snapshot and every registration/TXT record. Non-Avahi
+builds omit the mDNS diagnostic section and the `/readyz` mDNS entry. The dump
+does not include document bytes, does not enumerate registrations owned by
+other Avahi clients, and does not verify multicast reception by a client. The
+command binds this dump to `SIGUSR1` on Unix; platforms without that signal
+still retain the in-process diagnostic API and simply do not install a signal
+trigger.
 
 ## Configuration validation
 

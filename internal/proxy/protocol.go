@@ -228,9 +228,15 @@ func sameTargetURI(left, right string) bool {
 	if lerr != nil || rerr != nil || l.Scheme == "" || l.Host == "" || r.Scheme == "" || r.Host == "" {
 		return false
 	}
-	l.Path = strings.TrimRight(l.Path, "/")
-	r.Path = strings.TrimRight(r.Path, "/")
-	return l.String() == r.String()
+	if !strings.EqualFold(l.Scheme, r.Scheme) || l.RawQuery != "" || r.RawQuery != "" || l.Fragment != "" || r.Fragment != "" {
+		return false
+	}
+	// DNS-SD supplies the hostname and port used by the client. The HTTP
+	// router has already selected the queue from the request path, so the
+	// authority is not part of the queue identity here. Keep the URI scheme
+	// and resource path meaningful while allowing mDNS names, aliases, and
+	// explicit/default ports to vary between discovery and the request.
+	return strings.TrimRight(l.EscapedPath(), "/") == strings.TrimRight(r.EscapedPath(), "/")
 }
 
 func jobOperationRequiresTarget(op goipp.Op) bool {
@@ -315,7 +321,7 @@ func jobIDForPrinterURI(rawJobURI, printerURI string) (int, bool) {
 	if jobErr != nil || printerErr != nil || job.RawQuery != "" || job.Fragment != "" {
 		return 0, false
 	}
-	if !strings.EqualFold(job.Scheme, printer.Scheme) || !strings.EqualFold(job.Host, printer.Host) {
+	if job.Scheme == "" || printer.Scheme == "" || job.Host == "" || printer.Host == "" || !strings.EqualFold(job.Scheme, printer.Scheme) {
 		return 0, false
 	}
 	prefix := strings.TrimRight(printer.EscapedPath(), "/") + "/jobs/"

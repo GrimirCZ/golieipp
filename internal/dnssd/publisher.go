@@ -47,6 +47,24 @@ type Publication struct {
 	Records []ServiceRecord
 }
 
+// DebugState is a diagnostic snapshot of the publisher-owned DNS-SD state.
+// It is intentionally richer than the public readiness summary: the proxy
+// uses it only for an operator-requested signal dump.
+//
+// HasPublication means that the publisher has a last-known-good publication
+// snapshot. It does not prove that multicast packets are currently visible to
+// a client on the network.
+type DebugState struct {
+	Backend            string
+	Availability       string
+	EntryGroup         string
+	EntryGroupState    string
+	EntryGroupStateErr string
+	Closed             bool
+	HasPublication     bool
+	Publication        Publication
+}
+
 // Publisher is the seam consumed by the proxy lifecycle. Implementations must
 // make Update transactional from the caller's perspective: a failed update
 // leaves the prior publication in place and reports degraded state.
@@ -55,6 +73,14 @@ type Publisher interface {
 	Update(context.Context, ServiceInput) (Status, error)
 	Withdraw(context.Context) (Status, error)
 	Close() error
+}
+
+// DiagnosticPublisher is an optional extension used by the compile-time mDNS
+// diagnostic plugin. Keeping it separate from Publisher lets a lightweight or
+// third-party runtime publisher participate in publication without having to
+// implement operator-only state reporting.
+type DiagnosticPublisher interface {
+	DebugState() DebugState
 }
 
 // NewPublisher selects Avahi on Linux builds carrying the avahi tag and a
@@ -180,6 +206,28 @@ func (p *StubPublisher) Current() (Publication, bool) {
 		return Publication{}, false
 	}
 	return *clonePublication(p.current), true
+}
+
+func (p *StubPublisher) DebugState() DebugState {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	availability := "unavailable"
+	if p.disabled {
+		availability = "disabled"
+	} else if p.available {
+		availability = "available"
+	}
+	state := DebugState{
+		Backend:         "stub",
+		Availability:    availability,
+		EntryGroupState: "not_applicable",
+	}
+	if p.current != nil {
+		state.HasPublication = true
+		state.Publication = *clonePublication(p.current)
+	}
+	return state
 }
 
 func contextErr(ctx context.Context) error {

@@ -39,6 +39,26 @@ func TestAvahiCloseBoundsFreeContext(t *testing.T) {
 	}
 }
 
+func TestAvahiGroupStateName(t *testing.T) {
+	for _, test := range []struct {
+		state int32
+		want  string
+	}{
+		{state: avahiGroupUncommitted, want: "uncommitted"},
+		{state: avahiGroupRegistering, want: "registering"},
+		{state: avahiGroupEstablished, want: "established"},
+		{state: avahiGroupCollision, want: "collision"},
+		{state: avahiGroupFailure, want: "failure"},
+		{state: 99, want: "unknown(99)"},
+	} {
+		t.Run(test.want, func(t *testing.T) {
+			if got := avahiGroupStateName(test.state); got != test.want {
+				t.Fatalf("avahiGroupStateName(%d) = %q, want %q", test.state, got, test.want)
+			}
+		})
+	}
+}
+
 func TestAvahiUpdateRollsBackTXTRecordsOnLaterFailure(t *testing.T) {
 	oldInput := ServiceInput{
 		Name:     "Office",

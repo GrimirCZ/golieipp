@@ -41,6 +41,7 @@ type Service struct {
 	payloadSlots    map[string]chan struct{}
 	publishers      map[string]dnssd.Publisher
 	dnsRetrying     map[string]bool
+	refreshing      map[string]bool
 	lifecycleCtx    context.Context
 	lifecycleCancel context.CancelFunc
 	loopWG          sync.WaitGroup
@@ -51,18 +52,27 @@ type Service struct {
 }
 
 type queueHealth struct {
-	LastSuccess time.Time
-	LastAttempt time.Time
-	LastError   string
-	DNSDegraded bool
-	DNSState    string
-	DNSName     string
-	IPPEligible bool
+	LastSuccess      time.Time
+	LastAttempt      time.Time
+	LastError        string
+	DNSDegraded      bool
+	DNSState         string
+	DNSName          string
+	DNSLastAttempt   time.Time
+	DNSLastPublished time.Time
+	DNSLastError     string
+	DNSAttempts      int
+	IPPEligible      bool
 }
 
 type readinessResponse struct {
 	Ready  bool                      `json:"ready"`
+	MDNS   *mdnsReadiness            `json:"mdns,omitempty"`
 	Queues map[string]queueReadiness `json:"queues"`
+}
+
+type mdnsReadiness struct {
+	State string `json:"state"`
 }
 
 type queueReadiness struct {
@@ -71,9 +81,6 @@ type queueReadiness struct {
 	Stale        bool      `json:"stale"`
 	LastSuccess  time.Time `json:"last_success,omitempty"`
 	LastError    string    `json:"last_error,omitempty"`
-	DNSDegraded  bool      `json:"dns_sd_degraded"`
-	DNSState     string    `json:"dns_sd_state,omitempty"`
-	DNSName      string    `json:"dns_sd_name,omitempty"`
 	IPPEligible  bool      `json:"ipp_everywhere_eligible"`
 	IPPERequired bool      `json:"ipp_everywhere_required"`
 }
@@ -105,6 +112,7 @@ func NewService(cfg *config.Config, jobStore *store.Store, logger *slog.Logger) 
 		payloadSlots:    map[string]chan struct{}{},
 		publishers:      map[string]dnssd.Publisher{},
 		dnsRetrying:     map[string]bool{},
+		refreshing:      map[string]bool{},
 		lifecycleCtx:    lifecycleCtx,
 		lifecycleCancel: lifecycleCancel,
 		dnsCtx:          dnsCtx,
@@ -456,8 +464,12 @@ func (s *Service) logPrinterAvailable(queue string, printer config.PrinterConfig
 
 func (s *Service) refreshOne(ctx context.Context, queue string, printer config.PrinterConfig) (retErr error) {
 	start := time.Now()
+	s.mu.Lock()
+	s.refreshing[queue] = true
+	s.mu.Unlock()
 	defer func() {
 		s.mu.Lock()
+		delete(s.refreshing, queue)
 		health := s.queueHealth[queue]
 		health.LastAttempt = time.Now().UTC()
 		if retErr != nil {
@@ -499,7 +511,20 @@ func (s *Service) refreshOne(ctx context.Context, queue string, printer config.P
 		)
 		return err
 	}
-	eligible := upstreamClaimsIPPEverywhere(resp.Printer) && printer.IPPEverywhereMode != config.IPPEverywhereDisabled
+	claimEligible, ineligibleReason := ippEverywhereClaimEligibility(resp.Printer)
+	eligible := claimEligible && printer.IPPEverywhereMode != config.IPPEverywhereDisabled
+	if !eligible {
+		if printer.IPPEverywhereMode == config.IPPEverywhereDisabled {
+			ineligibleReason = "disabled by configuration (ipp_everywhere_mode=disabled)"
+		}
+		s.logger.Error("printer deemed IPP Everywhere-ineligible",
+			"queue", queue,
+			"upstream_uri", redactDumpString(printer.UpstreamURI),
+			"reason", ineligibleReason,
+			"ipp_everywhere_mode", printer.IPPEverywhereMode,
+			"configuration_override", printer.IPPEverywhereMode != config.IPPEverywhereAuto,
+		)
+	}
 	if printer.IPPEverywhereMode == config.IPPEverywhereRequired && !eligible {
 		s.mu.Lock()
 		_, hadPrevious := s.capabilities[queue]
@@ -513,7 +538,7 @@ func (s *Service) refreshOne(ctx context.Context, queue string, printer config.P
 		}
 		s.mu.Unlock()
 		s.syncDNSPublication(ctx, queue, printer, resp.Printer, false)
-		return errors.New("upstream does not advertise ipp-features-supported=ipp-everywhere")
+		return errors.New(ineligibleReason)
 	}
 	s.mu.Lock()
 	previous, hadPrevious := s.capabilities[queue]
@@ -595,6 +620,11 @@ func (s *Service) readyz(w http.ResponseWriter, _ *http.Request) {
 	result := readinessResponse{Ready: true, Queues: make(map[string]queueReadiness, len(s.cfg.Printers))}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	for _, plugin := range diagnosticPlugins() {
+		if contributor, ok := plugin.(readinessContributor); ok {
+			contributor.AddReadiness(&result, s)
+		}
+	}
 	for queue, printer := range s.cfg.Printers {
 		_, active := s.capabilities[queue]
 		health := s.queueHealth[queue]
@@ -605,9 +635,7 @@ func (s *Service) readyz(w http.ResponseWriter, _ *http.Request) {
 		stale := active && !health.LastSuccess.IsZero() && now.Sub(health.LastSuccess) > 2*interval
 		result.Queues[queue] = queueReadiness{
 			Optional: printer.Optional, Active: active, Stale: stale,
-			LastSuccess: health.LastSuccess, LastError: health.LastError,
-			DNSDegraded: health.DNSDegraded,
-			DNSState:    health.DNSState, DNSName: health.DNSName,
+			LastSuccess: health.LastSuccess, LastError: safeProbeError(errors.New(health.LastError), printer.UpstreamURI),
 			IPPEligible:  health.IPPEligible,
 			IPPERequired: printer.IPPEverywhereMode == config.IPPEverywhereRequired,
 		}
@@ -880,32 +908,46 @@ func (s *Service) handleGetPrinterAttributes(_ context.Context, queue string, pr
 }
 
 func upstreamClaimsIPPEverywhere(attrs goipp.Attributes) bool {
+	eligible, _ := ippEverywhereClaimEligibility(attrs)
+	return eligible
+}
+
+func ippEverywhereClaimEligibility(attrs goipp.Attributes) (bool, string) {
 	var (
 		claimFound bool
-		attrCount  int
+		claims     []goipp.Attribute
 	)
 	for _, attr := range attrs {
 		if !strings.EqualFold(attr.Name, "ipp-features-supported") {
 			continue
 		}
-		attrCount++
-		if len(attr.Values) == 0 {
-			return false
+		claims = append(claims, attr)
+	}
+	if len(claims) == 0 {
+		return false, "upstream did not provide ipp-features-supported"
+	}
+	if len(claims) > 1 {
+		return false, "upstream provided duplicate ipp-features-supported attributes"
+	}
+	if len(claims[0].Values) == 0 {
+		return false, "upstream provided an empty ipp-features-supported attribute"
+	}
+	for index, value := range claims[0].Values {
+		if value.T != goipp.TagKeyword {
+			return false, fmt.Sprintf("upstream ipp-features-supported value %d has tag %s, want keyword", index, value.T)
 		}
-		for _, value := range attr.Values {
-			if value.T != goipp.TagKeyword {
-				return false
-			}
-			feature, ok := value.V.(goipp.String)
-			if !ok || strings.TrimSpace(string(feature)) == "" {
-				return false
-			}
-			if string(feature) == "ipp-everywhere" {
-				claimFound = true
-			}
+		feature, ok := value.V.(goipp.String)
+		if !ok || strings.TrimSpace(string(feature)) == "" {
+			return false, fmt.Sprintf("upstream ipp-features-supported value %d is not a non-empty keyword", index)
+		}
+		if string(feature) == "ipp-everywhere" {
+			claimFound = true
 		}
 	}
-	return attrCount == 1 && claimFound
+	if !claimFound {
+		return false, "upstream ipp-features-supported does not include ipp-everywhere"
+	}
+	return true, ""
 }
 
 func (s *Service) syncDNSPublication(ctx context.Context, queue string, printer config.PrinterConfig, upstream goipp.Attributes, eligible bool) {
@@ -965,8 +1007,8 @@ func (s *Service) dnsServiceInput(queue string, printer config.PrinterConfig, up
 	}
 	return dnssd.ServiceInput{
 		Name: printer.DisplayName, Hostname: hostname,
-		Port: uint16(port), IPPS: strings.EqualFold(parsed.Scheme, "ipps"), Interface: s.cfg.DNSSD.Interface,
-		TXT:         printerDNSSDTXT(parsed.EscapedPath(), printer.DisplayName, printer.Location, clientAttrs, strings.EqualFold(parsed.Scheme, "ipps")),
+		Port: uint16(port), IPPS: false, Interface: s.cfg.DNSSD.Interface,
+		TXT:         printerDNSSDTXT(parsed.EscapedPath(), printer.DisplayName, printer.Location, clientAttrs),
 		GeoLocation: geoLocation,
 	}, nil
 }
@@ -1018,8 +1060,19 @@ func (s *Service) recordDNSStatus(queue string, status dnssd.Status) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	health := s.queueHealth[queue]
+	health.DNSLastAttempt = time.Now().UTC()
+	health.DNSAttempts = status.Attempts
 	health.DNSState = string(status.State)
 	health.DNSDegraded = status.State == dnssd.StateDegraded
+	if status.Err != nil {
+		health.DNSLastError = status.Err.Error()
+	}
+	if status.State == dnssd.StatePublished {
+		health.DNSLastPublished = health.DNSLastAttempt
+		health.DNSLastError = ""
+	} else if status.State == dnssd.StateWithdrawn || status.State == dnssd.StateDisabled {
+		health.DNSLastError = ""
+	}
 	if status.State == dnssd.StateWithdrawn || status.State == dnssd.StateDisabled {
 		health.DNSName = ""
 	} else if status.Name != "" {

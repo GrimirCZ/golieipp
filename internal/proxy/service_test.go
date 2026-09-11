@@ -61,7 +61,7 @@ func TestReadinessDistinguishesRequiredOptionalAndStaleQueues(t *testing.T) {
 
 	svc.mu.Lock()
 	svc.capabilities["required"] = goipp.Attributes{iattr.Name("printer-name", "Required")}
-	svc.queueHealth["required"] = queueHealth{LastSuccess: time.Now().Add(-3 * time.Minute), DNSDegraded: true}
+	svc.queueHealth["required"] = queueHealth{LastSuccess: time.Now().Add(-3 * time.Minute)}
 	svc.mu.Unlock()
 	recorder = httptest.NewRecorder()
 	svc.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/readyz", nil))
@@ -72,8 +72,72 @@ func TestReadinessDistinguishesRequiredOptionalAndStaleQueues(t *testing.T) {
 	if err := json.Unmarshal(recorder.Body.Bytes(), &readiness); err != nil {
 		t.Fatal(err)
 	}
-	if !readiness.Queues["required"].Stale || !readiness.Queues["required"].DNSDegraded {
-		t.Fatalf("readiness omitted stale/DNS state: %+v", readiness)
+	if !readiness.Queues["required"].Stale {
+		t.Fatalf("readiness omitted stale state: %+v", readiness)
+	}
+	if strings.Contains(recorder.Body.String(), "dns_sd_") {
+		t.Fatalf("readiness exposed detailed mDNS state: %s", recorder.Body.String())
+	}
+}
+
+func TestReadinessRedactsUpstreamCredentialsInLastError(t *testing.T) {
+	cfg := &config.Config{
+		Listen: config.ListenConfig{PublicBaseURL: "ipp://proxy/printers"},
+		Printers: map[string]config.PrinterConfig{
+			"office": {UpstreamURI: "ipp://user:secret@printer.local/ipp/print"},
+		},
+	}
+	svc, err := NewService(cfg, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc.mu.Lock()
+	svc.capabilities["office"] = goipp.Attributes{iattr.Name("printer-name", "Office")}
+	svc.queueHealth["office"] = queueHealth{
+		LastSuccess: time.Now().UTC(),
+		LastError:   "request failed for ipp://user:secret@printer.local/ipp/print",
+	}
+	svc.mu.Unlock()
+
+	recorder := httptest.NewRecorder()
+	svc.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("readyz returned %d", recorder.Code)
+	}
+	if strings.Contains(recorder.Body.String(), "secret") {
+		t.Fatalf("readyz leaked upstream credentials: %s", recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "ipp://redacted@printer.local/ipp/print") {
+		t.Fatalf("readyz did not preserve a redacted diagnostic error: %s", recorder.Body.String())
+	}
+}
+
+func TestDumpStateIncludesEffectiveConfigAndRedactsUpstreamCredentials(t *testing.T) {
+	var logBuffer bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuffer, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	cfg := &config.Config{
+		Listen:   config.ListenConfig{Addr: ":8631", PublicBaseURL: "ipp://proxy.local/printers"},
+		Defaults: config.DefaultsConfig{MaxEnvelopeBytes: 12345},
+		Printers: map[string]config.PrinterConfig{
+			"office": {UpstreamURI: "ipp://user:secret@printer.local/ipp/print", DisplayName: "Office"},
+		},
+	}
+	svc, err := NewService(cfg, nil, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc.DumpState()
+
+	output := logBuffer.String()
+	for _, want := range []string{
+		`"section":"application"`,
+		`"section":"effective_config"`,
+		`"max_envelope_bytes":12345`,
+		`"upstream_uri":"ipp://redacted@printer.local/ipp/print"`,
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("state dump missing %q: %s", want, output)
+		}
 	}
 }
 
@@ -110,9 +174,10 @@ func TestClientCapabilitiesDoNotAdvertiseUnsupportedOverrides(t *testing.T) {
 
 func TestUpstreamClaimsIPPEverywhereRequiresWellFormedKeywordSet(t *testing.T) {
 	tests := []struct {
-		name  string
-		attrs goipp.Attributes
-		want  bool
+		name   string
+		attrs  goipp.Attributes
+		want   bool
+		reason string
 	}{
 		{
 			name: "valid claim",
@@ -121,13 +186,19 @@ func TestUpstreamClaimsIPPEverywhereRequiresWellFormedKeywordSet(t *testing.T) {
 			want: true,
 		},
 		{
+			name:   "missing attribute",
+			reason: "upstream did not provide ipp-features-supported",
+		},
+		{
 			name: "wrong tag",
 			attrs: goipp.Attributes{goipp.MakeAttribute("ipp-features-supported", goipp.TagName,
 				goipp.String("ipp-everywhere"))},
+			reason: "upstream ipp-features-supported value 0 has tag nameWithoutLanguage, want keyword",
 		},
 		{
-			name:  "empty values",
-			attrs: goipp.Attributes{{Name: "ipp-features-supported"}},
+			name:   "empty values",
+			attrs:  goipp.Attributes{{Name: "ipp-features-supported"}},
+			reason: "upstream provided an empty ipp-features-supported attribute",
 		},
 		{
 			name: "duplicate attributes",
@@ -135,14 +206,83 @@ func TestUpstreamClaimsIPPEverywhereRequiresWellFormedKeywordSet(t *testing.T) {
 				goipp.MakeAttribute("ipp-features-supported", goipp.TagKeyword, goipp.String("ipp-everywhere")),
 				goipp.MakeAttribute("ipp-features-supported", goipp.TagKeyword, goipp.String("ipp-everywhere-server")),
 			},
+			reason: "upstream provided duplicate ipp-features-supported attributes",
+		},
+		{
+			name:   "missing feature",
+			attrs:  goipp.Attributes{goipp.MakeAttribute("ipp-features-supported", goipp.TagKeyword, goipp.String("ipp-everywhere-server"))},
+			reason: "upstream ipp-features-supported does not include ipp-everywhere",
 		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if got := upstreamClaimsIPPEverywhere(test.attrs); got != test.want {
+			got, reason := ippEverywhereClaimEligibility(test.attrs)
+			if got != test.want {
 				t.Fatalf("upstreamClaimsIPPEverywhere() = %t, want %t", got, test.want)
 			}
+			if reason != test.reason {
+				t.Fatalf("ippEverywhereClaimEligibility() reason = %q, want %q", reason, test.reason)
+			}
 		})
+	}
+}
+
+func TestRefreshLogsExactIPPEverywhereIneligibilityReason(t *testing.T) {
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	printer := config.PrinterConfig{
+		UpstreamURI:       "ipp://printer.invalid/ipp/print",
+		IPPEverywhereMode: config.IPPEverywhereAuto,
+		Policy: config.PolicyConfig{
+			Media:          "iso_a4_210x297mm",
+			MediaType:      "stationery",
+			PrintColorMode: "monochrome",
+		},
+	}
+	cfg := &config.Config{
+		Listen:   config.ListenConfig{PublicBaseURL: "ipp://proxy/printers"},
+		Printers: map[string]config.PrinterConfig{"office": printer},
+	}
+	svc, err := NewService(cfg, nil, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc.upstream.HTTP = &http.Client{Transport: upstreamRoundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		request := &goipp.Message{}
+		if err := request.Decode(req.Body); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		response := goipp.NewResponse(request.Version, goipp.StatusOk, request.RequestID)
+		response.Operation = responseOperationAttrs("")
+		response.Printer = goipp.Attributes{iattr.Keyword("media-supported", "iso_a4_210x297mm")}
+		envelope, err := response.EncodeBytes()
+		if err != nil {
+			t.Fatalf("encode response: %v", err)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Status:     "200 OK",
+			Header:     http.Header{"Content-Type": []string{goipp.ContentType}},
+			Body:       io.NopCloser(bytes.NewReader(envelope)),
+			Request:    req,
+		}, nil
+	})}
+	if err := svc.refreshOne(context.Background(), "office", printer); err != nil {
+		t.Fatalf("refreshOne() returned %v, want ordinary IPP refresh to remain usable", err)
+	}
+
+	logText := logs.String()
+	for _, want := range []string{
+		"level=ERROR",
+		"msg=\"printer deemed IPP Everywhere-ineligible\"",
+		"queue=office",
+		"reason=\"upstream did not provide ipp-features-supported\"",
+		"ipp_everywhere_mode=auto",
+		"configuration_override=false",
+	} {
+		if !strings.Contains(logText, want) {
+			t.Fatalf("log output missing %q: %s", want, logText)
+		}
 	}
 }
 
@@ -547,6 +687,93 @@ func TestPrintJobNormalizesEnvelopeAndStreamsPayload(t *testing.T) {
 	}
 	if job.EstimatedImpressions == nil || *job.EstimatedImpressions != 2 {
 		t.Fatalf("unexpected impressions: %+v", job)
+	}
+}
+
+func TestPrintJobPreservesURFPayloadAndDocumentFormat(t *testing.T) {
+	var upstreamFormat string
+	var upstreamPayload []byte
+	jobStore, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer jobStore.Close()
+
+	printer := config.PrinterConfig{
+		UpstreamURI: "ipp://printer.invalid/ipp/print",
+		Policy: config.PolicyConfig{
+			Media:          "iso_a4_210x297mm",
+			MediaType:      "stationery",
+			PrintColorMode: "monochrome",
+		},
+	}
+	cfg := &config.Config{
+		Listen:   config.ListenConfig{PublicBaseURL: "ipp://proxy/printers"},
+		Printers: map[string]config.PrinterConfig{"office": printer},
+	}
+	svc, err := NewService(cfg, jobStore, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	activateTestQueue(svc, "office")
+	svc.mu.Lock()
+	svc.capabilities["office"] = iattr.SetAttr(svc.capabilities["office"], goipp.MakeAttr(
+		"document-format-supported", goipp.TagMimeType,
+		goipp.String("application/pdf"), goipp.String("image/urf"),
+	))
+	svc.mu.Unlock()
+	svc.upstream.HTTP = &http.Client{Transport: upstreamRoundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		message := &goipp.Message{}
+		if err := message.Decode(req.Body); err != nil {
+			t.Fatalf("decode upstream request: %v", err)
+		}
+		upstreamFormat, _ = iattr.FirstString(message.Operation, "document-format")
+		upstreamPayload, err = io.ReadAll(req.Body)
+		if err != nil {
+			t.Fatalf("read upstream payload: %v", err)
+		}
+		response := goipp.NewResponse(message.Version, goipp.StatusOk, message.RequestID)
+		response.Operation = responseOperationAttrs("")
+		response.Job = goipp.Attributes{iattr.Integer("job-id", 88)}
+		envelope, err := response.EncodeBytes()
+		if err != nil {
+			t.Fatalf("encode upstream response: %v", err)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Status:     "200 OK",
+			Header:     http.Header{"Content-Type": []string{goipp.ContentType}},
+			Body:       io.NopCloser(bytes.NewReader(envelope)),
+			Request:    req,
+		}, nil
+	})}
+
+	request := goipp.NewRequest(goipp.DefaultVersion, goipp.OpPrintJob, 124)
+	request.Operation = append(iattr.BasicOperationAttrs("ipp://proxy/printers/office"),
+		goipp.MakeAttribute("document-format", goipp.TagMimeType, goipp.String("image/urf")),
+		iattr.Name("requesting-user-name", "jnovak"),
+		iattr.Name("job-name", "raster.urf"),
+	)
+	payload := []byte("URF\x00\x01\x02opaque-raster-bytes")
+	response, err := svc.handlePrintJob(context.Background(), "office", printer, request, bytes.NewReader(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if goipp.Status(response.Code) != goipp.StatusOk {
+		t.Fatalf("upstream response status = %s", goipp.Status(response.Code))
+	}
+	if upstreamFormat != "image/urf" {
+		t.Fatalf("upstream document format = %q, want image/urf", upstreamFormat)
+	}
+	if !bytes.Equal(upstreamPayload, payload) {
+		t.Fatalf("URF payload changed: %q", upstreamPayload)
+	}
+	job, err := jobStore.GetByProxyID(context.Background(), "office", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.DocumentFormat != "image/urf" || job.PayloadBytes != int64(len(payload)) {
+		t.Fatalf("URF job metadata = %+v", job)
 	}
 }
 
