@@ -9,6 +9,14 @@ import (
 )
 
 func printerDNSSDTXT(resourcePath, name, location string, attrs goipp.Attributes) map[string]string {
+	return printerDNSSDTXTForProfiles(resourcePath, name, location, attrs, CapabilityProfiles{
+		Ordinary:      CapabilityProfile{Ready: true},
+		AirPrint:      CapabilityProfile{Ready: true},
+		IPPEverywhere: CapabilityProfile{Ready: true},
+	})
+}
+
+func printerDNSSDTXTForProfiles(resourcePath, name, location string, attrs goipp.Attributes, profiles CapabilityProfiles) map[string]string {
 	model := name
 	if upstreamModel, ok := iattr.FirstString(attrs, "printer-make-and-model"); ok && strings.TrimSpace(upstreamModel) != "" {
 		model = upstreamModel
@@ -49,8 +57,10 @@ func printerDNSSDTXT(resourcePath, name, location string, attrs goipp.Attributes
 	if model, ok := iattr.FirstString(attrs, "printer-make-and-model"); ok && model != "" {
 		txt["product"] = "(" + model + ")"
 	}
-	if urf := stringValues(attrs, "urf-supported"); len(urf) > 0 {
-		txt["URF"] = strings.Join(urf, ",")
+	if profiles.AirPrint.Ready {
+		if urf := stringValues(attrs, "urf-supported"); len(urf) > 0 && validURFFamily(attrs) {
+			txt["URF"] = strings.Join(urf, ",")
+		}
 	}
 	return txt
 }

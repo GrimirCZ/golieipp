@@ -58,6 +58,13 @@ func TestReadinessDistinguishesRequiredOptionalAndStaleQueues(t *testing.T) {
 	if recorder.Code != http.StatusServiceUnavailable {
 		t.Fatalf("inactive required queue returned %d", recorder.Code)
 	}
+	var inactiveReadiness readinessResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &inactiveReadiness); err != nil {
+		t.Fatal(err)
+	}
+	if inactiveReadiness.Queues["required"].Profiles.Ordinary.Ready {
+		t.Fatalf("inactive queue reported ordinary profile ready: %+v", inactiveReadiness.Queues["required"])
+	}
 
 	svc.mu.Lock()
 	svc.capabilities["required"] = goipp.Attributes{iattr.Name("printer-name", "Required")}

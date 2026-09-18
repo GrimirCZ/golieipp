@@ -697,7 +697,15 @@ type CapabilityModel struct {
 	RequiredUnsatisfied []goipp.Op
 	IPPEligible         bool
 	IPPFeatures         []string
-	Attributes          goipp.Attributes
+	// Profiles are the practical, independently evaluated readiness profiles
+	// used by the service publication path. IPPEligible/IPPFeatures remain for
+	// source compatibility with the original capability helper; service-owned
+	// advertisements use Profiles rather than trusting an upstream claim.
+	Profiles   CapabilityProfiles
+	Warnings   []string
+	Attributes goipp.Attributes
+
+	practicalProfiles bool
 }
 
 // CapabilityModelOptions supplies the dynamic operation surface. A nil
@@ -706,6 +714,14 @@ type CapabilityModel struct {
 type CapabilityModelOptions struct {
 	Operations []goipp.Op
 	Disabled   bool
+	// EffectivePolicy is the upstream-proven projection of the configured
+	// policy. When empty, Policy is used as before for compatibility callers.
+	EffectivePolicy config.PolicyConfig
+	// PracticalProfiles asks synthesis to use the independent profile result
+	// for ipp-features-supported. The profile result is always computed and is
+	// available through CapabilityModel.Profiles.
+	PracticalProfiles bool
+	Warnings          []string
 }
 
 var proxyOperations = []goipp.Op{
@@ -750,7 +766,16 @@ func NewCapabilityModel(upstream goipp.Attributes, queueName, proxyURI string, p
 		ProxyURI:   proxyURI,
 		Disabled:   options.Disabled,
 		Operations: operations,
+		Warnings:   append([]string(nil), options.Warnings...),
 	}
+	if !policyConfigEmpty(options.EffectivePolicy) {
+		model.Policy = options.EffectivePolicy
+	}
+	if options.PracticalProfiles {
+		model.Printer.IPPEverywhereMode = normalizeIPPEverywhereMode(model.Printer.IPPEverywhereMode)
+		model.Printer.AirPrintMode = normalizeAirPrintMode(model.Printer.AirPrintMode)
+	}
+	model.practicalProfiles = options.PracticalProfiles
 	if len(metadata) > 0 {
 		model.Identity = metadata[0]
 	}
@@ -766,10 +791,16 @@ func SynthesizeCapabilityModel(model CapabilityModel) CapabilityModel {
 	if policyConfigEmpty(model.Printer.Policy) {
 		model.Printer.Policy = model.Policy
 	}
-	// The printer configuration is part of the model contract. Keep direct
-	// callers consistent with the service path, which already turns this mode
-	// into a disabled capability surface before synthesis.
-	if model.Printer.IPPEverywhereMode == config.IPPEverywhereDisabled {
+	// The effective policy is the client-facing policy snapshot. Keep it on the
+	// embedded printer configuration as well because the synthesizer uses that
+	// value when building media and color attributes.
+	model.Printer.Policy = model.Policy
+	// The old helper treated ipp_everywhere_mode=disabled as a disabled model.
+	// Keep that behavior for compatibility callers, while the service-owned
+	// practical profile path disables only the IPP Everywhere profile so
+	// ordinary IPP and AirPrint can continue independently.
+	legacyFeatureDisable := !model.practicalProfiles && model.Printer.IPPEverywhereMode == config.IPPEverywhereDisabled
+	if legacyFeatureDisable {
 		model.Disabled = true
 	}
 	// A non-nil empty operation set is an explicit disabled operation surface;
@@ -783,13 +814,24 @@ func SynthesizeCapabilityModel(model CapabilityModel) CapabilityModel {
 	model.Operations = uniqueOperations(model.Operations)
 	model.RequiredOperations = append([]goipp.Op(nil), ippEverywhereRequiredOperations...)
 	model.RequiredUnsatisfied = missingOperations(model.Operations, model.RequiredOperations)
-	// Eligibility deliberately trusts the upstream ipp-everywhere claim. The
-	// missing-operation list is diagnostic only; this proxy's advertisement is
-	// a compatibility signal, not a self-certification result.
-	model.IPPEligible = !model.Disabled && upstreamClaimsIPPEverywhere(model.Upstream)
-	model.IPPFeatures = nil
-	if model.IPPEligible {
-		model.IPPFeatures = []string{"ipp-everywhere", "ipp-everywhere-server"}
+	model.Profiles = evaluateCapabilityProfiles(model.Upstream, model.Printer, model.Policy, model.Operations, model.ProxyURI, model.Disabled)
+	model.Warnings = append(model.Warnings, model.Profiles.Warnings()...)
+	// Eligibility deliberately trusted the upstream claim in the original
+	// helper. Preserve its exported result unless the service opts into the
+	// practical profile gate; the latter is what protects client-facing
+	// ipp-features-supported from being a raw upstream mirror.
+	if model.practicalProfiles {
+		model.IPPEligible = model.Profiles.IPPEverywhere.Ready
+		model.IPPFeatures = nil
+		if model.IPPEligible {
+			model.IPPFeatures = []string{"ipp-everywhere", "ipp-everywhere-server"}
+		}
+	} else {
+		model.IPPEligible = !model.Disabled && upstreamClaimsIPPEverywhere(model.Upstream)
+		model.IPPFeatures = nil
+		if model.IPPEligible {
+			model.IPPFeatures = []string{"ipp-everywhere", "ipp-everywhere-server"}
+		}
 	}
 	model.Attributes = synthesizePrinterAttributes(model)
 	return model
@@ -799,7 +841,7 @@ func policyConfigEmpty(policy config.PolicyConfig) bool {
 	return strings.TrimSpace(policy.Media) == "" && len(policy.MediaSupported) == 0 &&
 		strings.TrimSpace(policy.MediaDefault) == "" && strings.TrimSpace(policy.MediaType) == "" &&
 		strings.TrimSpace(policy.PrintColorMode) == "" && policy.MediaSource == nil &&
-		policy.PrintScaling == nil && !policy.UseMediaCol
+		policy.PrintScaling == nil && strings.TrimSpace(policy.FidelityMode) == "" && !policy.UseMediaCol
 }
 
 func uniqueOperations(operations []goipp.Op) []goipp.Op {
@@ -1066,11 +1108,20 @@ func synthesizedFormatAttributes(upstream goipp.Attributes, policy config.Policy
 	urfOK := validURFFamily(upstream)
 	values := make(goipp.Values, 0, len(formatAttr.Values))
 	for _, value := range formatAttr.Values {
+		if value.T != goipp.TagMimeType {
+			continue
+		}
 		format, ok := value.V.(goipp.String)
 		if !ok || strings.TrimSpace(string(format)) == "" {
 			continue
 		}
 		lower := strings.ToLower(strings.TrimSpace(string(format)))
+		if lower == "application/octet-stream" {
+			// The generic octet-stream value is not a truthful payload
+			// capability: the proxy cannot infer its document syntax and must
+			// never admit it for a payload-bearing operation.
+			continue
+		}
 		switch lower {
 		case "image/pwg-raster":
 			if !pwgOK {
@@ -1139,7 +1190,7 @@ func formatInValues(format string, values goipp.Values) bool {
 
 func validURFFamily(upstream goipp.Attributes) bool {
 	formats, ok := iattr.Attr(upstream, "document-format-supported")
-	if !ok || !hasString(formats, "image/urf") {
+	if !ok || !hasMimeTypeValue(formats, "image/urf") {
 		return false
 	}
 	attr, ok := iattr.Attr(upstream, "urf-supported")
@@ -1220,7 +1271,7 @@ func splitURFTokens(text string) ([]string, bool) {
 
 func validPWGRasterFamily(upstream goipp.Attributes, policy config.PolicyConfig) bool {
 	formats, ok := iattr.Attr(upstream, "document-format-supported")
-	if !ok || !hasString(formats, "image/pwg-raster") {
+	if !ok || !hasMimeTypeValue(formats, "image/pwg-raster") {
 		return false
 	}
 	types, ok := iattr.Attr(upstream, "pwg-raster-document-type-supported")
@@ -1757,6 +1808,42 @@ func hasString(attr goipp.Attribute, value string) bool {
 		}
 	}
 	return false
+}
+
+func hasKeywordString(attr goipp.Attribute, wanted string) bool {
+	if len(attr.Values) == 0 {
+		return false
+	}
+	for _, value := range attr.Values {
+		if value.T != goipp.TagKeyword {
+			return false
+		}
+		text, ok := value.V.(goipp.String)
+		if !ok || strings.TrimSpace(string(text)) == "" {
+			return false
+		}
+		if strings.EqualFold(strings.TrimSpace(string(text)), wanted) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasMimeTypeValue(attr goipp.Attribute, wanted string) bool {
+	found := false
+	for _, val := range attr.Values {
+		if val.T != goipp.TagMimeType {
+			return false
+		}
+		text, ok := val.V.(goipp.String)
+		if !ok {
+			return false
+		}
+		if strings.EqualFold(string(text), wanted) {
+			found = true
+		}
+	}
+	return found
 }
 
 func dimensionsEqual(a, b mediaSize) bool {

@@ -19,11 +19,12 @@ go run ./cmd/golieipp -config config.yaml -debug
 Debug logs are structured JSON and include request correlation IDs, IPP operation/request IDs, upstream HTTP status, upstream IPP status, and timing. Document payload bytes are not logged.
 
 `GET /healthz` is process liveness. `GET /readyz` returns JSON for every queue,
-including active/stale state, the last refresh error, and IPP Everywhere
-eligibility. Linux `avahi` builds also include a small top-level `mdns.state`
-summary; detailed registrations are never exposed there. A required inactive
-queue makes readiness return 503; an inactive optional queue, a stale
-last-known-good snapshot, or mDNS degradation does not.
+including active/stale state, the last refresh error, and independent ordinary
+IPP, AirPrint, and IPP Everywhere readiness/reasons. Linux `avahi` builds also
+include a small top-level `mdns.state` summary; detailed registrations are
+never exposed there. A required inactive queue makes readiness return 503; an
+inactive optional queue, a stale last-known-good snapshot, or mDNS degradation
+does not.
 
 On Unix, request an on-demand local diagnostic snapshot with `SIGUSR1`:
 
@@ -182,14 +183,22 @@ Use the output to fill:
 
 - `printers.<queue>.upstream_uri`: the `UPSTREAM_URI` used for the probe.
 - `printers.<queue>.optional`: set to `true` to let the proxy start while this printer is offline. Optional printers are probed in the background immediately after startup and then at `refresh_interval`; the queue returns `printer-is-deactivated` until the first successful probe.
-- `printers.<queue>.ipp_everywhere_mode`: `auto` trusts an upstream
-  `ipp-features-supported=ipp-everywhere` claim, `required` leaves the queue
-  inactive without that claim, and `disabled` suppresses the proxy feature and
-  discovery advertisement. This is a compatibility advertisement, not proof
-  that the proxy passed the PWG self-certification suite.
-- `printers.<queue>.dns_sd`: opt a queue out of DNS-SD while retaining IPP
-  Everywhere feature attributes. Avahi loss is reported as degraded and
-  retried; it never deactivates an otherwise usable queue.
+- `printers.<queue>.ipp_everywhere_mode`: `auto` publishes the practical IPP
+  Everywhere profile only when the proxy's operation, identity, policy, and
+  document-format checks are ready; `disabled` withdraws only that profile.
+  The legacy value `required` is accepted, normalized to `auto`, and logged as
+  a migration warning. A formal IPP Everywhere conformance suite is not run at
+  runtime.
+- `printers.<queue>.airprint_mode`: `auto` publishes the AirPrint subtype only
+  when a valid upstream `image/urf` family and usable proxy policy are present;
+  `disabled` withdraws only AirPrint. Monochrome policy still preserves valid
+  upstream URF values while advertising `Color=F`.
+- `printers.<queue>.dns_sd`: opt a queue out of DNS-SD while retaining ordinary
+  IPP. Avahi loss is reported as degraded and retried; it never deactivates an
+  otherwise usable queue.
+- `dns_sd.allowed_aliases`: optional hostnames or IP addresses that may differ
+  from the host in `listen.public_base_url` without producing the DNS-SD
+  hostname mismatch warning. Ports are not accepted.
 - `printers.<queue>.geo_location`: optional `geo:` URI used for a DNS LOC
   record when the upstream does not provide `printer-geo-location`.
 - `printers.<queue>.location`: optional override for the advertised `printer-location`; use `""` or omit it to advertise an empty location.
@@ -213,8 +222,10 @@ responses (32 MiB), concurrent payload jobs per queue (2), and terminal-job
 retention (30 days). All are configurable as shown in `config.example.yaml`.
 
 Avahi capability refreshes replace DNS-SD TXT records on the existing entry
-group. Structural records (service endpoint, interface, and LOC) are fixed for
-that publisher lifetime and therefore require a proxy restart to change.
+group. Profile subtype changes rebuild the entry group because they are
+structural registrations. The public listener is plaintext-only, so the proxy
+does not publish `_ipps._tcp` records; ordinary `_ipp._tcp` remains available
+when AirPrint or IPP Everywhere is ineligible.
 
 ## Implemented IPP operations
 

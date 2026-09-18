@@ -30,9 +30,23 @@ type ServiceInput struct {
 	// TXT remains entirely caller-owned.
 	GeoLocation string
 
+	// Profiles selects which client-facing DNS-SD profiles are published by a
+	// profile-aware publisher. It is ignored by the legacy BuildRecords helper.
+	Profiles    PublicationProfiles
+	ProfilesSet bool
+
 	// MaxCollisionRetries bounds alternate-name attempts. Zero uses
 	// DefaultCollisionRetries; negative values are rejected.
 	MaxCollisionRetries int
+}
+
+// PublicationProfiles controls DNS-SD topology independently of ordinary IPP
+// availability. The base _ipp service is the ordinary profile; the two
+// subtype flags are deliberately independent.
+type PublicationProfiles struct {
+	Ordinary      bool
+	AirPrint      bool
+	IPPEverywhere bool
 }
 
 // PublishRequest and ServiceInfo are descriptive aliases kept for callers
@@ -59,6 +73,23 @@ func (r ServiceRecord) FullType() string {
 	return r.Subtype + "._sub." + strings.TrimPrefix(r.Type, ".")
 }
 
+func samePublicationStructure(left, right []ServiceRecord) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index].Name != right[index].Name ||
+			left[index].Hostname != right[index].Hostname ||
+			left[index].Port != right[index].Port ||
+			left[index].Type != right[index].Type ||
+			left[index].Subtype != right[index].Subtype ||
+			left[index].GeoLocation != right[index].GeoLocation {
+			return false
+		}
+	}
+	return true
+}
+
 // BuildRecords returns the registrations required for an IPP Everywhere
 // queue. The _universal subtype is used by AirPrint clients, while _print and
 // the legacy _printer._tcp registration preserve discovery by other clients.
@@ -83,6 +114,216 @@ func BuildRecords(input ServiceInput) ([]ServiceRecord, error) {
 		)
 	}
 	return ipp, nil
+}
+
+// BuildRecordsForProfiles builds the public plaintext DNS-SD topology used by
+// the proxy. It never emits _ipps records: the client-facing listener is
+// plaintext-only even when the upstream transport is IPPS.
+func BuildRecordsForProfiles(input ServiceInput, profiles PublicationProfiles) ([]ServiceRecord, error) {
+	if err := validateServiceInputBasic(input); err != nil {
+		return nil, err
+	}
+	if !profiles.Ordinary {
+		return nil, nil
+	}
+	txt, effectiveProfiles, err := fitProfileTXT(input.TXT, profiles)
+	if err != nil {
+		return nil, err
+	}
+	base := ServiceRecord{Name: input.Name, Hostname: input.Hostname, Port: input.Port, Type: "_ipp._tcp", TXT: txt, GeoLocation: input.GeoLocation}
+	records := []ServiceRecord{base}
+	if effectiveProfiles.IPPEverywhere {
+		records = append(records, ServiceRecord{Name: input.Name, Hostname: input.Hostname, Port: input.Port, Type: "_ipp._tcp", Subtype: "_print"})
+	}
+	if effectiveProfiles.AirPrint {
+		records = append(records, ServiceRecord{Name: input.Name, Hostname: input.Hostname, Port: input.Port, Type: "_ipp._tcp", Subtype: "_universal"})
+	}
+	records = append(records, ServiceRecord{Name: input.Name, Hostname: input.Hostname, Port: 0, Type: "_printer._tcp"})
+	return records, nil
+}
+
+func publicationProfilesForRecords(records []ServiceRecord) PublicationProfiles {
+	var profiles PublicationProfiles
+	for _, record := range records {
+		if record.Type != "_ipp._tcp" {
+			continue
+		}
+		switch record.Subtype {
+		case "":
+			profiles.Ordinary = true
+		case "_print":
+			profiles.IPPEverywhere = true
+		case "_universal":
+			profiles.AirPrint = true
+		}
+	}
+	return profiles
+}
+
+func validateServiceInputBasic(input ServiceInput) error {
+	if input.Name == "" {
+		return errors.New("service name is required")
+	}
+	if len([]byte(input.Name)) > 63 {
+		return errors.New("service name must not exceed 63 bytes")
+	}
+	if strings.IndexFunc(input.Name, func(r rune) bool { return unicode.IsControl(r) }) >= 0 {
+		return errors.New("service name must not contain control characters")
+	}
+	if input.Port == 0 {
+		return errors.New("service port must be positive")
+	}
+	if input.MaxCollisionRetries < 0 {
+		return errors.New("max collision retries must not be negative")
+	}
+	if input.GeoLocation != "" {
+		if _, err := EncodeLOC(input.GeoLocation); err != nil {
+			return fmt.Errorf("geo location: %w", err)
+		}
+	}
+	for key, value := range input.TXT {
+		if key == "" || strings.Contains(key, "=") {
+			return fmt.Errorf("TXT key %q is invalid", key)
+		}
+		if len([]byte(key)) > 255 || len([]byte(key))+1+len([]byte(value)) > 255 {
+			// Profile-aware publication can drop an optional value, but a
+			// required value is rejected by fitProfileTXT with a profile-specific
+			// result. Keep key/control validation here and defer the size check.
+			if strings.EqualFold(key, "rp") || strings.EqualFold(key, "txtvers") || strings.EqualFold(key, "qtotal") {
+				return fmt.Errorf("TXT entry %q exceeds 255 bytes", key)
+			}
+		}
+		if strings.IndexFunc(key, func(r rune) bool { return unicode.IsControl(r) }) >= 0 || strings.IndexFunc(value, func(r rune) bool { return unicode.IsControl(r) }) >= 0 {
+			return fmt.Errorf("TXT entry %q contains a control character", key)
+		}
+	}
+	return nil
+}
+
+// fitProfileTXT applies deterministic DNS-SD size admission. It preserves
+// routing essentials and drops optional keys by the package priority order. A
+// URF-only failure withdraws AirPrint; a pdl failure withdraws the richer
+// profiles while keeping ordinary _ipp publication usable.
+func fitProfileTXT(input map[string]string, profiles PublicationProfiles) (map[string]string, PublicationProfiles, error) {
+	txt := cloneTXT(input)
+	if !profiles.AirPrint {
+		deleteFold(txt, "urf")
+	}
+	profiles = fitProfilesForTXT(txt, profiles)
+	for {
+		entries := TXTEntries(txt)
+		err := validateTXTEntryLimits(entries)
+		if err == nil {
+			return txt, profiles, nil
+		}
+		if strings.Contains(err.Error(), "rp entry") {
+			return nil, PublicationProfiles{}, err
+		}
+		optional := optionalTXTKey(txt, profiles)
+		if optional == "" {
+			// If the only value that prevents a profile from fitting is a
+			// profile essential, withdraw that profile and retry the base TXT.
+			if profiles.AirPrint && hasFold(txt, "urf") {
+				deleteFold(txt, "urf")
+				profiles.AirPrint = false
+				continue
+			}
+			if profiles.IPPEverywhere && hasFold(txt, "pdl") {
+				deleteFold(txt, "pdl")
+				profiles.IPPEverywhere = false
+				profiles.AirPrint = false
+				continue
+			}
+			return nil, PublicationProfiles{}, err
+		}
+		deleteFold(txt, optional)
+	}
+}
+
+func fitProfilesForTXT(txt map[string]string, profiles PublicationProfiles) PublicationProfiles {
+	if profiles.AirPrint && !hasFold(txt, "urf") {
+		profiles.AirPrint = false
+	}
+	if (profiles.AirPrint || profiles.IPPEverywhere) && !hasFold(txt, "pdl") {
+		profiles.AirPrint = false
+		profiles.IPPEverywhere = false
+	}
+	return profiles
+}
+
+func validateTXTEntryLimits(entries []string) error {
+	total := 0
+	rpEnd := 0
+	for _, entry := range entries {
+		entryBytes := len([]byte(entry))
+		if entryBytes > maxTXTEntryBytes {
+			return fmt.Errorf("TXT entry exceeds %d bytes", maxTXTEntryBytes)
+		}
+		total += 1 + entryBytes
+		if strings.HasPrefix(strings.ToLower(entry), "rp=") && rpEnd == 0 {
+			rpEnd = total
+		}
+	}
+	if total > maxTXTDataBytes {
+		return fmt.Errorf("TXT data exceeds %d bytes", maxTXTDataBytes)
+	}
+	if rpEnd > maxRPBytes {
+		return fmt.Errorf("TXT rp entry must occur within the first %d bytes", maxRPBytes)
+	}
+	return nil
+}
+
+func optionalTXTKey(txt map[string]string, profiles PublicationProfiles) string {
+	keys := make([]string, 0, len(txt))
+	for key := range txt {
+		if isTXTProfileEssential(key, profiles) {
+			continue
+		}
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		leftPriority, rightPriority := txtKeyPriority(keys[i]), txtKeyPriority(keys[j])
+		if leftPriority != rightPriority {
+			return leftPriority > rightPriority
+		}
+		return strings.ToLower(keys[i]) > strings.ToLower(keys[j])
+	})
+	if len(keys) == 0 {
+		return ""
+	}
+	return keys[0]
+}
+
+func isTXTProfileEssential(key string, profiles PublicationProfiles) bool {
+	switch strings.ToLower(strings.TrimSpace(key)) {
+	case "rp", "txtvers", "qtotal":
+		return true
+	case "ty", "uuid":
+		return profiles.AirPrint || profiles.IPPEverywhere
+	case "pdl":
+		return profiles.AirPrint || profiles.IPPEverywhere
+	case "urf":
+		return profiles.AirPrint
+	default:
+		return false
+	}
+}
+
+func hasFold(txt map[string]string, wanted string) bool {
+	for key := range txt {
+		if strings.EqualFold(key, wanted) {
+			return true
+		}
+	}
+	return false
+}
+
+func deleteFold(txt map[string]string, wanted string) {
+	for key := range txt {
+		if strings.EqualFold(key, wanted) {
+			delete(txt, key)
+		}
+	}
 }
 
 func validateServiceInput(input ServiceInput) error {

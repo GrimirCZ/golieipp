@@ -80,6 +80,12 @@ func (mdnsDiagnosticPlugin) Dump(_ context.Context, snapshot diagnosticSnapshot)
 		queues = append(queues, map[string]any{
 			"queue":                   queue.Name,
 			"configured":              queue.Printer.DNSSD,
+			"ordinary_ready":          queue.Profiles.Ordinary.Ready,
+			"airprint_ready":          queue.Profiles.AirPrint.Ready,
+			"airprint_reason":         queue.Profiles.AirPrint.Reason,
+			"ipp_everywhere_ready":    queue.Profiles.IPPEverywhere.Ready,
+			"ipp_everywhere_reason":   queue.Profiles.IPPEverywhere.Reason,
+			"profile_warnings":        queue.Health.ProfileWarnings,
 			"ipp_everywhere_eligible": queue.Health.IPPEligible,
 			"retrying":                queue.DNSRetrying,
 			"state":                   queue.Health.DNSState,

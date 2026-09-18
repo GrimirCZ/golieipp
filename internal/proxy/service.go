@@ -12,6 +12,7 @@ import (
 	"mime"
 	"net/http"
 	"net/url"
+	"os"
 	"path"
 	"strconv"
 	"strings"
@@ -35,34 +36,41 @@ type Service struct {
 	startedAt       time.Time
 	configChangedAt map[string]time.Time
 
-	mu              sync.RWMutex
-	capabilities    map[string]goipp.Attributes
-	queueHealth     map[string]queueHealth
-	payloadSlots    map[string]chan struct{}
-	publishers      map[string]dnssd.Publisher
-	dnsRetrying     map[string]bool
-	refreshing      map[string]bool
-	lifecycleCtx    context.Context
-	lifecycleCancel context.CancelFunc
-	loopWG          sync.WaitGroup
-	dnsCtx          context.Context
-	dnsCancel       context.CancelFunc
-	dnsWG           sync.WaitGroup
-	closing         bool
+	mu               sync.RWMutex
+	capabilities     map[string]goipp.Attributes
+	capabilityModels map[string]CapabilityModel
+	queueHealth      map[string]queueHealth
+	payloadSlots     map[string]chan struct{}
+	publishers       map[string]dnssd.Publisher
+	dnsRetrying      map[string]bool
+	refreshing       map[string]bool
+	lifecycleCtx     context.Context
+	lifecycleCancel  context.CancelFunc
+	loopWG           sync.WaitGroup
+	dnsCtx           context.Context
+	dnsCancel        context.CancelFunc
+	dnsWG            sync.WaitGroup
+	closing          bool
 }
 
 type queueHealth struct {
-	LastSuccess      time.Time
-	LastAttempt      time.Time
-	LastError        string
-	DNSDegraded      bool
-	DNSState         string
-	DNSName          string
-	DNSLastAttempt   time.Time
-	DNSLastPublished time.Time
-	DNSLastError     string
-	DNSAttempts      int
-	IPPEligible      bool
+	OrdinaryReady       bool
+	AirPrintReady       bool
+	AirPrintReason      string
+	IPPEverywhereReady  bool
+	IPPEverywhereReason string
+	ProfileWarnings     []string
+	LastSuccess         time.Time
+	LastAttempt         time.Time
+	LastError           string
+	DNSDegraded         bool
+	DNSState            string
+	DNSName             string
+	DNSLastAttempt      time.Time
+	DNSLastPublished    time.Time
+	DNSLastError        string
+	DNSAttempts         int
+	IPPEligible         bool
 }
 
 type readinessResponse struct {
@@ -76,14 +84,30 @@ type mdnsReadiness struct {
 }
 
 type queueReadiness struct {
-	Optional     bool      `json:"optional"`
-	Active       bool      `json:"active"`
-	Stale        bool      `json:"stale"`
-	LastSuccess  time.Time `json:"last_success,omitempty"`
-	LastError    string    `json:"last_error,omitempty"`
-	IPPEligible  bool      `json:"ipp_everywhere_eligible"`
-	IPPERequired bool      `json:"ipp_everywhere_required"`
+	Optional            bool                            `json:"optional"`
+	Active              bool                            `json:"active"`
+	Stale               bool                            `json:"stale"`
+	LastSuccess         time.Time                       `json:"last_success,omitempty"`
+	LastError           string                          `json:"last_error,omitempty"`
+	IPPEligible         bool                            `json:"ipp_everywhere_eligible"`
+	IPPERequired        bool                            `json:"ipp_everywhere_required"`
+	Profiles            profileReadinessResponseSetType `json:"profiles"`
+	OrdinaryReady       bool                            `json:"ordinary_ready"`
+	AirPrintReady       bool                            `json:"airprint_ready"`
+	AirPrintReason      string                          `json:"airprint_reason,omitempty"`
+	IPPEverywhereReady  bool                            `json:"ipp_everywhere_ready"`
+	IPPEverywhereReason string                          `json:"ipp_everywhere_reason,omitempty"`
+	ProfileWarnings     []string                        `json:"profile_warnings,omitempty"`
 }
+
+type profileReadinessResponse struct {
+	Enabled  bool     `json:"enabled"`
+	Ready    bool     `json:"ready"`
+	Reason   string   `json:"reason,omitempty"`
+	Warnings []string `json:"warnings,omitempty"`
+}
+
+var localHostname = os.Hostname
 
 type traceIDContextKey struct{}
 
@@ -101,22 +125,23 @@ func NewService(cfg *config.Config, jobStore *store.Store, logger *slog.Logger) 
 		concurrency = 2
 	}
 	service := &Service{
-		cfg:             cfg,
-		store:           jobStore,
-		upstream:        NewUpstreamClient(logger),
-		logger:          logger,
-		startedAt:       startedAt,
-		configChangedAt: make(map[string]time.Time, len(cfg.Printers)),
-		capabilities:    map[string]goipp.Attributes{},
-		queueHealth:     map[string]queueHealth{},
-		payloadSlots:    map[string]chan struct{}{},
-		publishers:      map[string]dnssd.Publisher{},
-		dnsRetrying:     map[string]bool{},
-		refreshing:      map[string]bool{},
-		lifecycleCtx:    lifecycleCtx,
-		lifecycleCancel: lifecycleCancel,
-		dnsCtx:          dnsCtx,
-		dnsCancel:       dnsCancel,
+		cfg:              cfg,
+		store:            jobStore,
+		upstream:         NewUpstreamClient(logger),
+		logger:           logger,
+		startedAt:        startedAt,
+		configChangedAt:  make(map[string]time.Time, len(cfg.Printers)),
+		capabilities:     map[string]goipp.Attributes{},
+		capabilityModels: map[string]CapabilityModel{},
+		queueHealth:      map[string]queueHealth{},
+		payloadSlots:     map[string]chan struct{}{},
+		publishers:       map[string]dnssd.Publisher{},
+		dnsRetrying:      map[string]bool{},
+		refreshing:       map[string]bool{},
+		lifecycleCtx:     lifecycleCtx,
+		lifecycleCancel:  lifecycleCancel,
+		dnsCtx:           dnsCtx,
+		dnsCancel:        dnsCancel,
 	}
 	for queue := range cfg.Printers {
 		service.configChangedAt[queue] = startedAt
@@ -502,58 +527,60 @@ func (s *Service) refreshOne(ctx context.Context, queue string, printer config.P
 		)
 		return fmt.Errorf("upstream returned %s", goipp.Status(resp.Code))
 	}
-	if err := ValidatePolicyAgainstUpstream(resp.Printer, printer); err != nil {
-		s.logger.Debug("refresh upstream capabilities validation failed",
+	effectivePolicy, policyWarnings, err := ProjectPolicyAgainstUpstream(resp.Printer, printer)
+	if err != nil {
+		s.logger.Warn("refresh upstream capabilities policy projection failed",
 			"queue", queue,
 			"upstream_uri", redactDumpString(printer.UpstreamURI),
 			"duration_ms", durationMillis(start),
+			"policy_unavailable", true,
 			"error", err,
 		)
 		return err
 	}
-	claimEligible, ineligibleReason := ippEverywhereClaimEligibility(resp.Printer)
-	eligible := claimEligible && printer.IPPEverywhereMode != config.IPPEverywhereDisabled
-	if !eligible {
-		if printer.IPPEverywhereMode == config.IPPEverywhereDisabled {
-			ineligibleReason = "disabled by configuration (ipp_everywhere_mode=disabled)"
-		}
+	model := NewCapabilityModel(resp.Printer, queue, s.proxyPrinterURI(queue), printer, CapabilityModelOptions{
+		Operations:        proxySupportedOperations(resp.Printer),
+		EffectivePolicy:   effectivePolicy,
+		PracticalProfiles: true,
+		Warnings:          policyWarnings,
+	}, s.proxyPrinterIdentity(queue))
+	profiles := model.Profiles
+	if !profiles.IPPEverywhere.Ready {
 		s.logger.Error("printer deemed IPP Everywhere-ineligible",
 			"queue", queue,
 			"upstream_uri", redactDumpString(printer.UpstreamURI),
-			"reason", ineligibleReason,
-			"ipp_everywhere_mode", printer.IPPEverywhereMode,
-			"configuration_override", printer.IPPEverywhereMode != config.IPPEverywhereAuto,
+			"reason", profiles.IPPEverywhere.Reason,
+			"ipp_everywhere_mode", normalizeIPPEverywhereMode(printer.IPPEverywhereMode),
+			"configuration_override", normalizeIPPEverywhereMode(printer.IPPEverywhereMode) != config.IPPEverywhereAuto,
 		)
 	}
-	if printer.IPPEverywhereMode == config.IPPEverywhereRequired && !eligible {
-		s.mu.Lock()
-		_, hadPrevious := s.capabilities[queue]
-		previousEligibility := s.queueHealth[queue].IPPEligible
-		delete(s.capabilities, queue)
-		health := s.queueHealth[queue]
-		health.IPPEligible = false
-		s.queueHealth[queue] = health
-		if hadPrevious || previousEligibility {
-			s.advanceConfigEpochLocked(queue)
-		}
-		s.mu.Unlock()
-		s.syncDNSPublication(ctx, queue, printer, resp.Printer, false)
-		return errors.New(ineligibleReason)
+	for _, warning := range model.Warnings {
+		s.logger.Warn("capability profile warning",
+			"queue", queue,
+			"warning", warning,
+		)
 	}
 	s.mu.Lock()
 	previous, hadPrevious := s.capabilities[queue]
-	previousEligibility := s.queueHealth[queue].IPPEligible
-	if !hadPrevious || !stablePrinterAttributes(previous).Similar(stablePrinterAttributes(resp.Printer)) || previousEligibility != eligible {
+	previousModel, hadPreviousModel := s.capabilityModels[queue]
+	if !hadPrevious || !stablePrinterAttributes(previous).Similar(stablePrinterAttributes(resp.Printer)) || !hadPreviousModel || !sameCapabilityProfiles(previousModel.Profiles, profiles) || !samePolicySnapshot(previousModel.Policy, effectivePolicy) {
 		s.advanceConfigEpochLocked(queue)
 	}
 	s.capabilities[queue] = resp.Printer.DeepCopy()
+	s.capabilityModels[queue] = model
 	health := s.queueHealth[queue]
 	health.LastSuccess = time.Now().UTC()
 	health.LastError = ""
-	health.IPPEligible = eligible
+	health.OrdinaryReady = profiles.Ordinary.Ready
+	health.AirPrintReady = profiles.AirPrint.Ready
+	health.AirPrintReason = profiles.AirPrint.Reason
+	health.IPPEverywhereReady = profiles.IPPEverywhere.Ready
+	health.IPPEverywhereReason = profiles.IPPEverywhere.Reason
+	health.ProfileWarnings = append([]string(nil), model.Warnings...)
+	health.IPPEligible = profiles.IPPEverywhere.Ready
 	s.queueHealth[queue] = health
 	s.mu.Unlock()
-	s.syncDNSPublication(ctx, queue, printer, resp.Printer, eligible)
+	s.syncDNSPublication(ctx, queue, printer, resp.Printer, profiles)
 	s.logger.Debug("refresh upstream capabilities completed",
 		"queue", queue,
 		"upstream_uri", redactDumpString(printer.UpstreamURI),
@@ -626,18 +653,30 @@ func (s *Service) readyz(w http.ResponseWriter, _ *http.Request) {
 		}
 	}
 	for queue, printer := range s.cfg.Printers {
-		_, active := s.capabilities[queue]
+		upstream, active := s.capabilities[queue]
 		health := s.queueHealth[queue]
+		profiles := s.profilesLocked(queue, printer, upstream)
+		if !active {
+			profiles = evaluateCapabilityProfiles(nil, printer, printer.Policy, nil, s.proxyPrinterURI(queue), true)
+		}
 		interval := printer.RefreshInterval
 		if interval <= 0 {
 			interval = 5 * time.Minute
 		}
 		stale := active && !health.LastSuccess.IsZero() && now.Sub(health.LastSuccess) > 2*interval
+		ordinaryReady := profiles.Ordinary.Ready
 		result.Queues[queue] = queueReadiness{
 			Optional: printer.Optional, Active: active, Stale: stale,
 			LastSuccess: health.LastSuccess, LastError: safeProbeError(errors.New(health.LastError), printer.UpstreamURI),
-			IPPEligible:  health.IPPEligible,
-			IPPERequired: printer.IPPEverywhereMode == config.IPPEverywhereRequired,
+			IPPEligible:         profiles.IPPEverywhere.Ready,
+			IPPERequired:        false,
+			Profiles:            profileReadinessResponseSet(profiles),
+			OrdinaryReady:       ordinaryReady,
+			AirPrintReady:       profiles.AirPrint.Ready,
+			AirPrintReason:      profiles.AirPrint.Reason,
+			IPPEverywhereReady:  profiles.IPPEverywhere.Ready,
+			IPPEverywhereReason: profiles.IPPEverywhere.Reason,
+			ProfileWarnings:     append([]string(nil), health.ProfileWarnings...),
 		}
 		if !printer.Optional && !active {
 			result.Ready = false
@@ -743,6 +782,18 @@ func (s *Service) ippHandler(w http.ResponseWriter, r *http.Request) {
 		shapeIPPResponse(resp)
 		writeIPP(w, resp)
 		return
+	}
+	if op == goipp.OpPrintJob || (op == goipp.OpSendDocument && hasPayload) {
+		if protocolErr := validateExplicitDocumentFormat(req.Operation); protocolErr != nil {
+			logger.Warn("ipp request rejected", "reason", "document_format_required", "error", protocolErr)
+			s.writeIPPProtocolError(w, req.Version, req.RequestID, protocolErr)
+			return
+		}
+		if protocolErr := s.validatePayloadDocumentFormat(queue, req); protocolErr != nil {
+			logger.Warn("ipp request rejected", "reason", "document_format_not_admitted", "error", protocolErr)
+			s.writeIPPProtocolError(w, req.Version, req.RequestID, protocolErr)
+			return
+		}
 	}
 	var staged *stagedPayload
 	if r.ContentLength < 0 && (op == goipp.OpPrintJob || op == goipp.OpSendDocument) {
@@ -950,12 +1001,15 @@ func ippEverywhereClaimEligibility(attrs goipp.Attributes) (bool, string) {
 	return true, ""
 }
 
-func (s *Service) syncDNSPublication(ctx context.Context, queue string, printer config.PrinterConfig, upstream goipp.Attributes, eligible bool) {
+func (s *Service) syncDNSPublication(ctx context.Context, queue string, printer config.PrinterConfig, upstream goipp.Attributes, profiles CapabilityProfiles) {
 	publisher := s.publishers[queue]
 	if publisher == nil {
 		return
 	}
-	if !eligible || !printer.DNSSD || s.cfg.DNSSD.Mode == config.DNSModeOff {
+	// The ordinary IPP service is the base publication. AirPrint and IPP
+	// Everywhere only control their own subtypes and never suppress this base
+	// endpoint when their profile checks fail.
+	if !profiles.Ordinary.Ready || !printer.DNSSD || s.cfg.DNSSD.Mode == config.DNSModeOff {
 		status, withdrawErr := publisher.Withdraw(ctx)
 		if withdrawErr != nil && status.Err == nil {
 			status.Err = withdrawErr
@@ -967,7 +1021,7 @@ func (s *Service) syncDNSPublication(ctx context.Context, queue string, printer 
 		}
 		return
 	}
-	input, err := s.dnsServiceInput(queue, printer, upstream)
+	input, err := s.dnsServiceInputWithProfiles(queue, printer, upstream, profiles)
 	if err != nil {
 		s.recordDNSStatus(queue, dnssd.Status{State: dnssd.StateDegraded, Err: err})
 		return
@@ -984,6 +1038,11 @@ func (s *Service) syncDNSPublication(ctx context.Context, queue string, printer 
 }
 
 func (s *Service) dnsServiceInput(queue string, printer config.PrinterConfig, upstream goipp.Attributes) (dnssd.ServiceInput, error) {
+	profiles := s.profilesFor(queue, printer, upstream)
+	return s.dnsServiceInputWithProfiles(queue, printer, upstream, profiles)
+}
+
+func (s *Service) dnsServiceInputWithProfiles(queue string, printer config.PrinterConfig, upstream goipp.Attributes, profiles CapabilityProfiles) (dnssd.ServiceInput, error) {
 	printerURI := s.proxyPrinterURI(queue)
 	parsed, err := url.Parse(printerURI)
 	if err != nil || parsed.Hostname() == "" {
@@ -999,7 +1058,25 @@ func (s *Service) dnsServiceInput(queue string, printer config.PrinterConfig, up
 	clientAttrs := s.clientCapabilities(queue, printer, upstream)
 	hostname := s.cfg.DNSSD.Hostname
 	if hostname == "" {
-		hostname = parsed.Hostname()
+		resolved, hostnameErr := localHostname()
+		if hostnameErr != nil || strings.TrimSpace(resolved) == "" {
+			s.logger.Warn("local hostname lookup failed for DNS-SD; using public endpoint host",
+				"queue", queue,
+				"error", hostnameErr,
+				"fallback_hostname", parsed.Hostname(),
+			)
+			hostname = parsed.Hostname()
+		} else {
+			hostname = strings.TrimSuffix(strings.TrimSpace(resolved), ".")
+		}
+	}
+	publicHost := parsed.Hostname()
+	if !hostsMatchOrAreAllowedAliases(hostname, publicHost, s.cfg.DNSSD.AllowedAliases) {
+		s.logger.Warn("DNS-SD hostname differs from public endpoint host",
+			"queue", queue,
+			"dns_sd_hostname", hostname,
+			"public_endpoint_host", publicHost,
+		)
 	}
 	geoLocation, _ := iattr.FirstString(upstream, "printer-geo-location")
 	if geoLocation == "" {
@@ -1008,17 +1085,69 @@ func (s *Service) dnsServiceInput(queue string, printer config.PrinterConfig, up
 	return dnssd.ServiceInput{
 		Name: printer.DisplayName, Hostname: hostname,
 		Port: uint16(port), IPPS: false, Interface: s.cfg.DNSSD.Interface,
-		TXT:         printerDNSSDTXT(parsed.EscapedPath(), printer.DisplayName, printer.Location, clientAttrs),
+		TXT:         printerDNSSDTXTForProfiles(parsed.EscapedPath(), printer.DisplayName, printer.Location, clientAttrs, profiles),
 		GeoLocation: geoLocation,
+		Profiles:    dnssd.PublicationProfiles{Ordinary: profiles.Ordinary.Ready, AirPrint: profiles.AirPrint.Ready, IPPEverywhere: profiles.IPPEverywhere.Ready},
+		ProfilesSet: true,
 	}, nil
 }
 
+func hostsMatchOrAreAllowedAliases(dnsSDHostname, publicEndpointHost string, allowedAliases []string) bool {
+	dnsHost := canonicalDNSHost(dnsSDHostname)
+	publicHost := canonicalDNSHost(publicEndpointHost)
+	if dnsHost == publicHost {
+		return true
+	}
+	for _, alias := range allowedAliases {
+		canonicalAlias := canonicalDNSHost(alias)
+		if canonicalAlias == dnsHost || canonicalAlias == publicHost {
+			return true
+		}
+	}
+	return false
+}
+
+func canonicalDNSHost(raw string) string {
+	return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(raw), "."))
+}
+
 func (s *Service) clientCapabilities(queue string, printer config.PrinterConfig, upstream goipp.Attributes) goipp.Attributes {
-	attrs := FilterPrinterAttributesWithOperations(upstream.DeepCopy(), queue, s.proxyPrinterURI(queue), printer, proxySupportedOperations(upstream), s.proxyPrinterIdentity(queue))
+	s.mu.RLock()
+	model, ok := s.capabilityModels[queue]
+	s.mu.RUnlock()
+	var attrs goipp.Attributes
+	if ok && len(model.Attributes) > 0 {
+		// The capability snapshot owns the stable printer description, while
+		// proxy-owned identity clocks are intentionally live per response.
+		// Refresh the identity after a capability epoch advances so a committed
+		// model cannot pin clients to the pre-refresh timestamp.
+		model.Identity = s.proxyPrinterIdentity(queue)
+		model.Attributes = nil
+		attrs = FilterPrinterAttributesWithModel(model)
+	} else {
+		attrs = FilterPrinterAttributesWithOperations(upstream.DeepCopy(), queue, s.proxyPrinterURI(queue), printer, proxySupportedOperations(upstream), s.proxyPrinterIdentity(queue))
+	}
 	// The current request path does not preserve an overrides collection as a
 	// supported job-template attribute. Do not claim support in the client view
 	// until a fully validated forwarding path is enabled.
 	return iattr.DropAttrs(attrs, "overrides-supported")
+}
+
+func (s *Service) profilesFor(queue string, printer config.PrinterConfig, upstream goipp.Attributes) CapabilityProfiles {
+	s.mu.RLock()
+	profiles := s.profilesLocked(queue, printer, upstream)
+	s.mu.RUnlock()
+	return profiles
+}
+
+// profilesLocked returns the last committed profile snapshot. When a caller
+// constructs a Service test double by populating capabilities directly, derive
+// a deterministic fallback without mutating service state.
+func (s *Service) profilesLocked(queue string, printer config.PrinterConfig, upstream goipp.Attributes) CapabilityProfiles {
+	if model, ok := s.capabilityModels[queue]; ok {
+		return model.Profiles
+	}
+	return evaluateCapabilityProfiles(upstream, printer, printer.Policy, proxySupportedOperations(upstream), s.proxyPrinterURI(queue), false)
 }
 
 func proxySupportedOperations(upstream goipp.Attributes) []goipp.Op {
@@ -1054,6 +1183,61 @@ func operationAvailable(operations []goipp.Op, wanted goipp.Op) bool {
 		}
 	}
 	return false
+}
+
+// validatePayloadDocumentFormat admits only formats from the committed,
+// proxy-filtered capability snapshot. A Service created in package tests can
+// still populate capabilities directly; in that compatibility mode there is
+// no committed effective-format set to enforce.
+func (s *Service) validatePayloadDocumentFormat(queue string, req *goipp.Message) *ProtocolError {
+	format, ok := iattr.FirstString(req.Operation, "document-format")
+	if !ok || strings.TrimSpace(format) == "" {
+		return &ProtocolError{
+			Status:      goipp.StatusErrorDocumentFormatNotSupported,
+			Message:     "document-format is not admitted for a payload-bearing operation",
+			Unsupported: attrsNamed(req.Operation, "document-format"),
+		}
+	}
+	formatKey := strings.ToLower(strings.TrimSpace(format))
+
+	s.mu.RLock()
+	model, hasModel := s.capabilityModels[queue]
+	health := s.queueHealth[queue]
+	printer := s.cfg.Printers[queue]
+	s.mu.RUnlock()
+	if !hasModel {
+		return nil
+	}
+
+	formats, present := effectiveFormatSet(model.Upstream, model.Policy)
+	if !present || len(formats) == 0 {
+		return &ProtocolError{
+			Status:  goipp.StatusErrorDocumentFormatNotSupported,
+			Message: "the proxy has no admitted document formats",
+		}
+	}
+	if _, supported := formats[formatKey]; !supported {
+		return &ProtocolError{
+			Status:      goipp.StatusErrorDocumentFormatNotSupported,
+			Message:     fmt.Sprintf("document-format %q is not supported by the proxy", format),
+			Unsupported: attrsNamed(req.Operation, "document-format"),
+		}
+	}
+
+	interval := printer.RefreshInterval
+	if interval <= 0 {
+		interval = 5 * time.Minute
+	}
+	if !health.LastSuccess.IsZero() && time.Since(health.LastSuccess) > 2*interval {
+		s.logger.Warn("forwarding document format from stale capability snapshot",
+			"queue", queue,
+			"document_format", format,
+			"stale", true,
+			"last_success", health.LastSuccess,
+			"last_error", health.LastError,
+		)
+	}
+	return nil
 }
 
 func (s *Service) recordDNSStatus(queue string, status dnssd.Status) {
@@ -1110,14 +1294,14 @@ func (s *Service) scheduleDNSRetry(ctx context.Context, queue string, publisher 
 			case <-timer.C:
 			}
 			s.mu.RLock()
-			eligible := s.queueHealth[queue].IPPEligible
 			printer := s.cfg.Printers[queue]
+			profiles := s.profilesLocked(queue, printer, s.capabilities[queue])
 			s.mu.RUnlock()
-			if !eligible || !printer.DNSSD || s.cfg.DNSSD.Mode == config.DNSModeOff {
+			if !profiles.Ordinary.Ready || !printer.DNSSD || s.cfg.DNSSD.Mode == config.DNSModeOff {
 				return
 			}
 			latestUpstream := s.upstreamCapabilities(queue)
-			latestInput, inputErr := s.dnsServiceInput(queue, printer, latestUpstream)
+			latestInput, inputErr := s.dnsServiceInputWithProfiles(queue, printer, latestUpstream, profiles)
 			if inputErr != nil {
 				s.recordDNSStatus(queue, dnssd.Status{State: dnssd.StateDegraded, Name: input.Name, Err: inputErr})
 				continue
@@ -1216,6 +1400,12 @@ func (s *Service) handleValidateJob(ctx context.Context, queue string, printer c
 }
 
 func (s *Service) handlePrintJob(ctx context.Context, queue string, printer config.PrinterConfig, req *goipp.Message, payload io.Reader) (*goipp.Message, error) {
+	if protocolErr := validateExplicitDocumentFormat(req.Operation); protocolErr != nil {
+		return protocolResponse(req, protocolErr.Status, protocolErr.Message), nil
+	}
+	if protocolErr := s.validatePayloadDocumentFormat(queue, req); protocolErr != nil {
+		return protocolResponse(req, protocolErr.Status, protocolErr.Message), nil
+	}
 	normalizedResult, rejected := s.normalizeJobRequest(queue, printer, req)
 	if rejected != nil {
 		return rejected, nil
@@ -1371,11 +1561,17 @@ func (s *Service) normalizeJobRequest(queue string, printer config.PrinterConfig
 			fidelity = bool(value)
 		}
 	}
+	policy := printer.Policy
+	s.mu.RLock()
+	if model, ok := s.capabilityModels[queue]; ok {
+		policy = model.Policy
+	}
+	s.mu.RUnlock()
 	result, err := NormalizeJobAttrsWithOptions(req.Job, NormalizationOptions{
-		Policy: printer.Policy, Upstream: s.upstreamCapabilities(queue),
+		Policy: policy, Upstream: s.upstreamCapabilities(queue),
 		DropVendorAttrs:  printer.Passthrough.DropVendorAttrs,
 		PreserveJobAttrs: printer.Passthrough.PreserveJobAttrs,
-		Fidelity:         fidelity, FidelityMode: FidelityMode(printer.Policy.FidelityMode),
+		Fidelity:         fidelity, FidelityMode: FidelityMode(policy.FidelityMode),
 	})
 	if err == nil {
 		return result, nil
@@ -1405,6 +1601,14 @@ func applyNormalizationResult(resp *goipp.Message, result NormalizationResult) {
 }
 
 func (s *Service) handleSendDocument(ctx context.Context, queue string, printer config.PrinterConfig, req *goipp.Message, payload io.Reader, hasPayload bool) (*goipp.Message, error) {
+	if hasPayload {
+		if protocolErr := validateExplicitDocumentFormat(req.Operation); protocolErr != nil {
+			return protocolResponse(req, protocolErr.Status, protocolErr.Message), nil
+		}
+		if protocolErr := s.validatePayloadDocumentFormat(queue, req); protocolErr != nil {
+			return protocolResponse(req, protocolErr.Status, protocolErr.Message), nil
+		}
+	}
 	proxyJobID := requestProxyJobID(req)
 	job, err := s.lookupRequestJob(ctx, queue, req)
 	if err != nil {

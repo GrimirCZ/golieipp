@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"net"
 	"net/url"
 	"os"
 	"strconv"
@@ -49,17 +50,30 @@ const (
 
 	IPPEverywhereDisabled = "disabled"
 	IPPEverywhereAuto     = "auto"
+
+	// IPPEverywhereRequired is retained as a source-compatibility constant for
+	// callers that used the pre-profile API. Configuration values of "required"
+	// are normalized to "auto" and produce a migration warning.
 	IPPEverywhereRequired = "required"
 
 	IPPEverywhereModeDisabled = IPPEverywhereDisabled
 	IPPEverywhereModeAuto     = IPPEverywhereAuto
 	IPPEverywhereModeRequired = IPPEverywhereRequired
+
+	AirPrintDisabled = "disabled"
+	AirPrintAuto     = "auto"
+
+	AirPrintModeDisabled = AirPrintDisabled
+	AirPrintModeAuto     = AirPrintAuto
 )
 
 type DNSSDConfig struct {
 	Mode      string `yaml:"mode"`
 	Hostname  string `yaml:"hostname"`
 	Interface string `yaml:"interface"`
+	// AllowedAliases contains alternate hostnames or IP addresses that are
+	// valid for the client-facing DNS-SD/public endpoint comparison.
+	AllowedAliases []string `yaml:"allowed_aliases"`
 
 	modeSet bool
 }
@@ -178,6 +192,7 @@ type PrinterConfig struct {
 	Location          string            `yaml:"location"`
 	Optional          bool              `yaml:"optional"`
 	IPPEverywhereMode string            `yaml:"ipp_everywhere_mode"`
+	AirPrintMode      string            `yaml:"airprint_mode"`
 	DNSSD             bool              `yaml:"dns_sd"`
 	GeoLocation       string            `yaml:"geo_location"`
 	RefreshInterval   time.Duration     `yaml:"-"`
@@ -190,6 +205,7 @@ type PrinterConfig struct {
 	DNS_SD bool `yaml:"-"`
 
 	ippEverywhereModeSet bool
+	airPrintModeSet      bool
 	dnsSDSet             bool
 }
 
@@ -213,6 +229,8 @@ func (p *PrinterConfig) UnmarshalYAML(node *yaml.Node) error {
 		switch node.Content[i].Value {
 		case "ipp_everywhere_mode":
 			p.ippEverywhereModeSet = true
+		case "airprint_mode":
+			p.airPrintModeSet = true
 		case "dns_sd":
 			p.dnsSDSet = true
 		}
@@ -301,6 +319,9 @@ func LoadWithLogger(path string, logger *slog.Logger) (*Config, error) {
 	if err := document.Decode(&cfg); err != nil {
 		return nil, err
 	}
+	for _, warning := range cfg.NormalizeLegacyModes() {
+		logger.Warn("deprecated configuration value", "warning", warning)
+	}
 	cfg.applyDefaults()
 	if err := cfg.Validate(); err != nil {
 		return nil, err
@@ -309,6 +330,7 @@ func LoadWithLogger(path string, logger *slog.Logger) (*Config, error) {
 }
 
 func (c *Config) applyDefaults() {
+	c.normalizeLegacyModes()
 	defaultsProvided := c.Defaults.hasValues()
 	limitsProvided := c.Limits.hasValues()
 	if defaultsProvided && limitsProvided {
@@ -336,6 +358,9 @@ func (c *Config) applyDefaults() {
 		}
 		if printer.IPPEverywhereMode == "" && !printer.ippEverywhereModeSet {
 			printer.IPPEverywhereMode = IPPEverywhereAuto
+		}
+		if printer.AirPrintMode == "" && !printer.airPrintModeSet {
+			printer.AirPrintMode = AirPrintAuto
 		}
 		if printer.dnsSDSet {
 			// Explicit YAML values, including false, are authoritative.
@@ -370,6 +395,29 @@ func (c *Config) applyDefaults() {
 		}
 		c.Printers[name] = printer
 	}
+}
+
+// NormalizeLegacyModes converts configuration spellings that were accepted by
+// older releases into the independent profile configuration. It returns
+// human-readable migration warnings so command-line callers can surface them
+// without making legacy deployments fail to start.
+func (c *Config) NormalizeLegacyModes() []string {
+	if c == nil {
+		return nil
+	}
+	return c.normalizeLegacyModes()
+}
+
+func (c *Config) normalizeLegacyModes() []string {
+	var warnings []string
+	for queue, printer := range c.Printers {
+		if printer.IPPEverywhereMode == IPPEverywhereRequired {
+			printer.IPPEverywhereMode = IPPEverywhereAuto
+			warnings = append(warnings, fmt.Sprintf("printers.%s.ipp_everywhere_mode=required is deprecated; using auto", queue))
+		}
+		c.Printers[queue] = printer
+	}
+	return warnings
 }
 
 func (p *PolicyConfig) applyMediaDefaults() {
@@ -444,6 +492,9 @@ func (d *DefaultsConfig) applyDefaults() {
 }
 
 func (c *Config) Validate() error {
+	// Validate is also used by embedders that construct Config values directly,
+	// so apply the same compatibility normalization as LoadWithLogger.
+	c.normalizeLegacyModes()
 	if c.Listen.PublicBaseURL == "" {
 		return errors.New("listen.public_base_url is required")
 	}
@@ -482,7 +533,10 @@ func (c *Config) Validate() error {
 			}
 		}
 		if !validIPPEverywhereMode(printer.IPPEverywhereMode) {
-			return fmt.Errorf("printers.%s.ipp_everywhere_mode must be one of disabled, auto, required", name)
+			return fmt.Errorf("printers.%s.ipp_everywhere_mode must be one of disabled, auto", name)
+		}
+		if !validAirPrintMode(printer.AirPrintMode) {
+			return fmt.Errorf("printers.%s.airprint_mode must be one of disabled, auto", name)
 		}
 		if printer.GeoLocation != "" {
 			if err := validateGeoLocation(printer.GeoLocation); err != nil {
@@ -569,6 +623,17 @@ func validateDNSSD(d DNSSDConfig) error {
 			return fmt.Errorf("hostname: %w", err)
 		}
 	}
+	seenAliases := make(map[string]struct{}, len(d.AllowedAliases))
+	for i, alias := range d.AllowedAliases {
+		if err := validateHostAlias(alias); err != nil {
+			return fmt.Errorf("allowed_aliases[%d]: %w", i, err)
+		}
+		key := canonicalHost(alias)
+		if _, ok := seenAliases[key]; ok {
+			return fmt.Errorf("allowed_aliases[%d]: duplicate alias", i)
+		}
+		seenAliases[key] = struct{}{}
+	}
 	if strings.IndexFunc(d.Interface, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) >= 0 {
 		return errors.New("interface must not contain whitespace or control characters")
 	}
@@ -578,9 +643,35 @@ func validateDNSSD(d DNSSDConfig) error {
 	return nil
 }
 
+func validateHostAlias(raw string) error {
+	if strings.TrimSpace(raw) != raw || raw == "" {
+		return errors.New("must be a hostname or IP address without a port")
+	}
+	if net.ParseIP(raw) != nil {
+		return nil
+	}
+	if err := validateHostname(raw); err != nil {
+		return errors.New("must be a hostname or IP address without a port")
+	}
+	return nil
+}
+
+func canonicalHost(raw string) string {
+	return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(raw), "."))
+}
+
 func validIPPEverywhereMode(mode string) bool {
 	switch mode {
-	case IPPEverywhereDisabled, IPPEverywhereAuto, IPPEverywhereRequired:
+	case IPPEverywhereDisabled, IPPEverywhereAuto:
+		return true
+	default:
+		return false
+	}
+}
+
+func validAirPrintMode(mode string) bool {
+	switch mode {
+	case AirPrintDisabled, AirPrintAuto:
 		return true
 	default:
 		return false
@@ -995,6 +1086,7 @@ func configYAMLSchema() *yamlSchema {
 		"location":            keyword,
 		"optional":            keyword,
 		"ipp_everywhere_mode": keyword,
+		"airprint_mode":       keyword,
 		"dns_sd":              keyword,
 		"geo_location":        keyword,
 		"refresh_interval":    keyword,
@@ -1025,9 +1117,10 @@ func configYAMLSchema() *yamlSchema {
 			"sqlite_path": keyword,
 		}),
 		"dns_sd": objectSchema(map[string]*yamlSchema{
-			"mode":      keyword,
-			"hostname":  keyword,
-			"interface": keyword,
+			"mode":            keyword,
+			"hostname":        keyword,
+			"interface":       keyword,
+			"allowed_aliases": keyword,
 		}),
 		"defaults": defaults,
 		"limits":   defaults,

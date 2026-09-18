@@ -15,16 +15,19 @@ dns_sd:
   mode: auto
   hostname: ""
   interface: ""
+  # Hostnames or IP addresses that are valid alternate public endpoint hosts.
+  allowed_aliases: []
 printers:
   office-a4-bw:
     upstream_uri: "ipp://192.168.10.50/ipp/print"
     display_name: "Office A4 B&W"
     location: "Office"
     optional: false
-    # Trust and mirror the upstream ipp-everywhere feature claim. "required"
-    # keeps the queue inactive unless the upstream makes that claim;
-    # "disabled" suppresses both feature values and DNS-SD publication.
+    # "auto" enables the practical IPP Everywhere profile when the proxy can
+    # serve it end-to-end; "disabled" withdraws only that profile.
     ipp_everywhere_mode: auto
+    # AirPrint is independent from ordinary IPP and IPP Everywhere.
+    airprint_mode: auto
     dns_sd: true
     geo_location: ""
     refresh_interval: "5m"

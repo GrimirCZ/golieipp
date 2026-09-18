@@ -698,6 +698,65 @@ func TestCapabilityModelReportsDynamicIPPFeatureEligibility(t *testing.T) {
 	}
 }
 
+func TestPracticalCapabilityProfilesAreIndependentAndDoNotMirrorOctetStream(t *testing.T) {
+	printer := config.PrinterConfig{
+		AirPrintMode:      config.AirPrintAuto,
+		IPPEverywhereMode: config.IPPEverywhereAuto,
+		Policy: config.PolicyConfig{
+			Media:          "iso_a4_210x297mm",
+			MediaType:      "stationery",
+			PrintColorMode: "monochrome",
+		},
+	}
+	upstream := goipp.Attributes{
+		iattr.Keyword("media-supported", "iso_a4_210x297mm"),
+		goipp.MakeAttr("operations-supported", goipp.TagEnum,
+			goipp.Integer(goipp.OpGetPrinterAttributes),
+			goipp.Integer(goipp.OpPrintJob),
+			goipp.Integer(goipp.OpValidateJob),
+			goipp.Integer(goipp.OpCreateJob),
+			goipp.Integer(goipp.OpSendDocument),
+			goipp.Integer(goipp.OpCancelJob),
+			goipp.Integer(goipp.OpGetJobAttributes),
+			goipp.Integer(goipp.OpGetJobs),
+			goipp.Integer(goipp.OpCancelMyJobs),
+			goipp.Integer(goipp.OpCloseJob),
+			goipp.Integer(goipp.OpIdentifyPrinter)),
+		goipp.MakeAttr("document-format-supported", goipp.TagMimeType,
+			goipp.String("application/pdf"), goipp.String("application/octet-stream"), goipp.String("image/urf")),
+		iattr.Keyword("ipp-features-supported", "ipp-everywhere"),
+		iattr.Keywords("urf-supported", "V1.4", "W8", "SRGB24", "RS300"),
+	}
+	model := NewCapabilityModel(upstream, "office", "ipp://proxy/printers/office", printer, CapabilityModelOptions{
+		Operations:        proxySupportedOperations(upstream),
+		PracticalProfiles: true,
+	}, defaultPrinterIdentityMetadata("ipp://proxy/printers/office"))
+	if !model.Profiles.Ordinary.Ready || !model.Profiles.AirPrint.Ready || !model.Profiles.IPPEverywhere.Ready {
+		t.Fatalf("complete practical capability set was not ready: %+v", model.Profiles)
+	}
+	if !model.IPPEligible || !iattr.HasStringValue(model.Attributes, "ipp-features-supported", "ipp-everywhere") {
+		t.Fatalf("ready practical IPP Everywhere profile was not advertised: %+v", model)
+	}
+	if iattr.HasStringValue(model.Attributes, "document-format-supported", "application/octet-stream") {
+		t.Fatal("application/octet-stream leaked into the client format capability")
+	}
+	if got, ok := iattr.FirstString(model.Attributes, "print-color-mode-supported"); !ok || got != "monochrome" {
+		t.Fatalf("monochrome policy was not synthesized: %q", got)
+	}
+
+	printer.AirPrintMode = config.AirPrintDisabled
+	disabledAirPrint := NewCapabilityModel(upstream, "office", "ipp://proxy/printers/office", printer, CapabilityModelOptions{
+		Operations:        proxySupportedOperations(upstream),
+		PracticalProfiles: true,
+	}, defaultPrinterIdentityMetadata("ipp://proxy/printers/office"))
+	if !disabledAirPrint.Profiles.Ordinary.Ready || !disabledAirPrint.Profiles.IPPEverywhere.Ready {
+		t.Fatalf("disabling AirPrint changed unrelated profile readiness: %+v", disabledAirPrint.Profiles)
+	}
+	if disabledAirPrint.Profiles.AirPrint.Ready || disabledAirPrint.Profiles.AirPrint.Reason == "" {
+		t.Fatalf("AirPrint disable was not isolated: %+v", disabledAirPrint.Profiles.AirPrint)
+	}
+}
+
 func TestCapabilityModelHonorsPrinterIPPEverywhereDisabledMode(t *testing.T) {
 	printer := config.PrinterConfig{IPPEverywhereMode: config.IPPEverywhereDisabled, Policy: config.PolicyConfig{
 		Media:          "iso_a4_210x297mm",

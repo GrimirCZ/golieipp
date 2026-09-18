@@ -173,6 +173,70 @@ printers:
 	if cfg.Printers["disabled"].GeoLocation != "geo:50.0755,14.4378" {
 		t.Fatalf("unexpected geo location %q", cfg.Printers["disabled"].GeoLocation)
 	}
+	if got := cfg.Printers["default"].AirPrintMode; got != AirPrintAuto {
+		t.Fatalf("expected AirPrint default %q, got %q", AirPrintAuto, got)
+	}
+}
+
+func TestLoadDNSAllowedAliases(t *testing.T) {
+	cfg := loadConfigYAML(t, `
+listen:
+  public_base_url: "ipp://public.example:8631/printers"
+dns_sd:
+  allowed_aliases:
+    - dns-sd.example
+    - 198.51.100.10
+printers:
+  office:
+    upstream_uri: "ipp://printer.example/ipp/print"
+`)
+	got := cfg.DNSSD.AllowedAliases
+	if len(got) != 2 || got[0] != "dns-sd.example" || got[1] != "198.51.100.10" {
+		t.Fatalf("unexpected DNS-SD allowed aliases: %#v", got)
+	}
+}
+
+func TestLoadRejectsInvalidDNSAllowedAlias(t *testing.T) {
+	_, err := loadConfigYAMLError(t, `
+listen:
+  public_base_url: "ipp://proxy.example/printers"
+dns_sd:
+  allowed_aliases:
+    - "http://dns-sd.example"
+printers:
+  office:
+    upstream_uri: "ipp://printer.example/ipp/print"
+`)
+	if err == nil || !strings.Contains(err.Error(), "allowed_aliases") {
+		t.Fatalf("expected invalid DNS-SD alias error, got %v", err)
+	}
+}
+
+func TestLoadNormalizesLegacyIPPEverywhereRequiredWithWarning(t *testing.T) {
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	data := []byte(`
+listen:
+  public_base_url: "ipp://proxy.example/printers"
+printers:
+  office:
+    upstream_uri: "ipp://printer.example/ipp/print"
+    ipp_everywhere_mode: required
+`)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadWithLogger(path, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Printers["office"].IPPEverywhereMode; got != IPPEverywhereAuto {
+		t.Fatalf("legacy mode was not normalized: %q", got)
+	}
+	if !strings.Contains(logs.String(), "ipp_everywhere_mode=required is deprecated") {
+		t.Fatalf("migration warning missing: %s", logs.String())
+	}
 }
 
 func TestLoadWarnsOnUnknownAndDeprecatedYAMLKeys(t *testing.T) {

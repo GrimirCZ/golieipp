@@ -1,6 +1,9 @@
 package proxy
 
 import (
+	"bytes"
+	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/OpenPrinting/goipp"
@@ -69,5 +72,39 @@ func TestDNSServiceInputUsesPublicPathAndPlaintextTXT(t *testing.T) {
 	}
 	if _, ok := input.TXT["TLS"]; ok {
 		t.Fatalf("plaintext DNS-SD input advertised TLS: %#v", input.TXT)
+	}
+}
+
+func TestDNSServiceInputAllowsConfiguredHostAlias(t *testing.T) {
+	var logs bytes.Buffer
+	printer := config.PrinterConfig{
+		DisplayName:       "Office",
+		IPPEverywhereMode: config.IPPEverywhereAuto,
+		Policy: config.PolicyConfig{
+			Media:          "iso_a4_210x297mm",
+			MediaType:      "stationery",
+			PrintColorMode: "monochrome",
+		},
+	}
+	cfg := &config.Config{
+		Listen: config.ListenConfig{PublicBaseURL: "ipp://public.example:8631/printers"},
+		DNSSD: config.DNSSDConfig{
+			Hostname:       "dns-sd.example",
+			AllowedAliases: []string{"dns-sd.example"},
+		},
+		Printers: map[string]config.PrinterConfig{"office": printer},
+	}
+	svc, err := NewService(cfg, nil, slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.dnsServiceInput("office", printer, goipp.Attributes{
+		iattr.Keyword("media-supported", "iso_a4_210x297mm"),
+		iattr.Keyword("ipp-features-supported", "ipp-everywhere"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(logs.String(), "DNS-SD hostname differs from public endpoint host") {
+		t.Fatalf("configured DNS-SD alias still produced a mismatch warning: %s", logs.String())
 	}
 }

@@ -135,9 +135,21 @@ func (p *StubPublisher) Update(ctx context.Context, input ServiceInput) (Status,
 	if err := contextErr(ctx); err != nil {
 		return Status{State: StateDegraded, Name: input.Name, Err: err}, err
 	}
-	records, err := BuildRecords(input)
+	var records []ServiceRecord
+	var err error
+	if input.ProfilesSet {
+		records, err = BuildRecordsForProfiles(input, input.Profiles)
+	} else {
+		records, err = BuildRecords(input)
+	}
 	if err != nil {
 		return Status{State: StateDegraded, Name: input.Name, Err: err}, err
+	}
+	if input.ProfilesSet {
+		if !input.Profiles.Ordinary {
+			return p.Withdraw(ctx)
+		}
+		input.Profiles = publicationProfilesForRecords(records)
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()

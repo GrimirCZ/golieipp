@@ -64,6 +64,7 @@ type diagnosticQueue struct {
 	DNSRetrying          bool
 	UpstreamCapabilities goipp.Attributes
 	ClientCapabilities   goipp.Attributes
+	Profiles             CapabilityProfiles
 	Publisher            dnssd.Publisher
 }
 
@@ -113,6 +114,7 @@ func (applicationDiagnosticPlugin) Dump(_ context.Context, snapshot diagnosticSn
 			"display_name":            queue.Printer.DisplayName,
 			"location":                queue.Printer.Location,
 			"optional":                queue.Printer.Optional,
+			"airprint_mode":           queue.Printer.AirPrintMode,
 			"ipp_everywhere_mode":     queue.Printer.IPPEverywhereMode,
 			"active":                  queue.Active,
 			"stale":                   queue.Stale,
@@ -122,6 +124,8 @@ func (applicationDiagnosticPlugin) Dump(_ context.Context, snapshot diagnosticSn
 			"last_attempt":            health.LastAttempt,
 			"last_error":              diagnosticError(health.LastError, queue.Printer.UpstreamURI),
 			"ipp_everywhere_eligible": health.IPPEligible,
+			"profiles":                diagnosticProfiles(queue.Profiles),
+			"profile_warnings":        health.ProfileWarnings,
 			"payload_jobs_in_flight":  queue.PayloadJobsInFlight,
 			"payload_job_capacity":    queue.PayloadJobCapacity,
 		}
@@ -225,6 +229,7 @@ func (s *Service) captureDiagnosticSnapshot() diagnosticSnapshot {
 			interval = 5 * time.Minute
 		}
 		health := s.queueHealth[queue]
+		profiles := s.profilesLocked(queue, printer, s.capabilities[queue])
 		payloadJobsInFlight, payloadJobCapacity := 0, 0
 		if slot := s.payloadSlots[queue]; slot != nil {
 			payloadJobsInFlight = len(slot)
@@ -239,6 +244,7 @@ func (s *Service) captureDiagnosticSnapshot() diagnosticSnapshot {
 			RefreshInFlight:     s.refreshing[queue],
 			ConfigChangedAt:     s.configChangedAt[queue],
 			Health:              health,
+			Profiles:            profiles,
 			PayloadJobsInFlight: payloadJobsInFlight,
 			PayloadJobCapacity:  payloadJobCapacity,
 			DNSRetrying:         s.dnsRetrying[queue],
@@ -286,6 +292,7 @@ func effectiveConfigDump(cfg *config.Config) map[string]any {
 			"location":            printer.Location,
 			"optional":            printer.Optional,
 			"ipp_everywhere_mode": printer.IPPEverywhereMode,
+			"airprint_mode":       printer.AirPrintMode,
 			"dns_sd":              printer.DNSSD,
 			"geo_location":        printer.GeoLocation,
 			"refresh_interval":    printer.RefreshInterval,
@@ -303,9 +310,10 @@ func effectiveConfigDump(cfg *config.Config) map[string]any {
 		},
 		"defaults": defaultsConfigDump(cfg.Defaults),
 		"dns_sd": map[string]any{
-			"mode":      cfg.DNSSD.Mode,
-			"hostname":  cfg.DNSSD.Hostname,
-			"interface": cfg.DNSSD.Interface,
+			"mode":            cfg.DNSSD.Mode,
+			"hostname":        cfg.DNSSD.Hostname,
+			"interface":       cfg.DNSSD.Interface,
+			"allowed_aliases": append([]string(nil), cfg.DNSSD.AllowedAliases...),
 		},
 		"printers": printers,
 	}
@@ -348,6 +356,23 @@ func optionalConfigString(value *string) any {
 		return nil
 	}
 	return *value
+}
+
+func diagnosticProfiles(profiles CapabilityProfiles) map[string]any {
+	return map[string]any{
+		"ordinary":       diagnosticProfile(profiles.Ordinary),
+		"airprint":       diagnosticProfile(profiles.AirPrint),
+		"ipp_everywhere": diagnosticProfile(profiles.IPPEverywhere),
+	}
+}
+
+func diagnosticProfile(profile CapabilityProfile) map[string]any {
+	return map[string]any{
+		"enabled":  profile.Enabled,
+		"ready":    profile.Ready,
+		"reason":   profile.Reason,
+		"warnings": append([]string(nil), profile.Warnings...),
+	}
 }
 
 func diagnosticError(message, upstreamURI string) string {

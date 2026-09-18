@@ -68,6 +68,62 @@ func TestBuildRecordsIncludesIPPSVariantsWhenRequested(t *testing.T) {
 	}
 }
 
+func TestBuildRecordsForProfilesPublishesOnlyReadyPlaintextProfiles(t *testing.T) {
+	records, err := BuildRecordsForProfiles(ServiceInput{
+		Name:     "Secure Printer",
+		Hostname: "proxy.example.test",
+		Port:     631,
+		IPPS:     true,
+		TXT: map[string]string{
+			"rp":    "printers/office",
+			"pdl":   "application/pdf,image/urf",
+			"URF":   "V1.4,W8,SRGB24,RS300",
+			"Color": "F",
+		},
+	}, PublicationProfiles{Ordinary: true, IPPEverywhere: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var types []string
+	for _, record := range records {
+		types = append(types, record.FullType())
+		if strings.HasPrefix(record.Type, "_ipps") {
+			t.Fatalf("plaintext profile publication emitted secure service: %#v", record)
+		}
+	}
+	want := []string{"_ipp._tcp", "_print._sub._ipp._tcp", "_printer._tcp"}
+	if !reflect.DeepEqual(types, want) {
+		t.Fatalf("profile service types = %#v, want %#v", types, want)
+	}
+	if records[len(records)-1].Port != 0 {
+		t.Fatalf("legacy _printer._tcp port = %d, want 0", records[len(records)-1].Port)
+	}
+}
+
+func TestBuildRecordsForProfilesDropsOnlyProfileWithOversizedEssentialTXT(t *testing.T) {
+	records, err := BuildRecordsForProfiles(ServiceInput{
+		Name:     "Office",
+		Hostname: "proxy.example.test",
+		Port:     631,
+		TXT: map[string]string{
+			"rp":  "printers/office",
+			"pdl": "application/pdf",
+			"URF": strings.Repeat("x", 260),
+		},
+	}, PublicationProfiles{Ordinary: true, AirPrint: true, IPPEverywhere: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, record := range records {
+		if record.FullType() == "_universal._sub._ipp._tcp" {
+			t.Fatalf("AirPrint subtype survived an oversized URF essential: %#v", records)
+		}
+	}
+	if len(records) != 3 || records[0].FullType() != "_ipp._tcp" || records[1].FullType() != "_print._sub._ipp._tcp" || records[2].FullType() != "_printer._tcp" {
+		t.Fatalf("unrelated profiles were not retained: %#v", records)
+	}
+}
+
 func TestBuildRecordsRejectsInvalidInput(t *testing.T) {
 	tests := []ServiceInput{
 		{Name: "", Hostname: "proxy.example.test", Port: 8631},

@@ -7,12 +7,19 @@ enforcement, job virtualization, transport, and observability. It also adds an
 optional Avahi DNS-SD publisher.
 
 The `ipp-everywhere` and `ipp-everywhere-server` values are deliberately a
-**compatibility advertisement**, not a formal conformance assertion. A queue
-advertises them only when its configured upstream printer advertises
-`ipp-features-supported=ipp-everywhere` and the queue mode permits it. The
-proxy trusts that upstream claim; it does not run the PWG self-certification
-suite at runtime. `ipp_everywhere_mode: required` turns absence of the upstream
-claim into an inactive queue. `auto` leaves such a queue active as ordinary IPP.
+**practical profile advertisement**, not a formal conformance assertion. A
+queue advertises them only when the upstream claim, proxy operation surface,
+proxy identity, effective policy, and admitted document formats make the
+profile usable end-to-end. The proxy does not run the PWG self-certification
+suite at runtime. `ipp_everywhere_mode: required` is a legacy spelling
+normalized to `auto` with a migration warning; `disabled` withdraws only the
+IPP Everywhere profile. AirPrint has its independent `airprint_mode` and
+valid-URF gate.
+
+Ordinary `_ipp._tcp` publication and client IPP remain available when either
+rich profile is ineligible. `_print._sub._ipp._tcp` is IPP Everywhere only and
+`_universal._sub._ipp._tcp` is AirPrint only. The plaintext client listener
+never receives `_ipps._tcp` registrations.
 
 DNS-SD availability never controls the IPP feature attributes or queue
 readiness. Losing Avahi marks discovery degraded, retains the IPP queue, and
@@ -26,7 +33,7 @@ The implementation is organized around four state-owning modules:
    cardinality, syntax, operation-specific document rules, and response shape.
 2. **Capability model** owns coupled client-visible capabilities, including
    media instances, formats, raster/URF families, color, operations, identity,
-   and the optional IPP Everywhere feature pair.
+   and three independent ordinary/AirPrint/IPP Everywhere readiness profiles.
 3. **Job registry** owns proxy IDs, upstream mappings, lifecycle uncertainty,
    document counters, observations, reconciliation, and retention.
 4. **DNS-SD publisher** accepts a complete queue publication snapshot and
@@ -174,9 +181,10 @@ active.
 
 - `/healthz`: process liveness.
 - `/readyz`: JSON overall/per-queue readiness, optional/active/stale fields,
-  last success/error, and IPP Everywhere eligibility. Linux `avahi` builds add
-  only a small aggregate `mdns.state` entry; detailed mDNS state is available
-  through the signal diagnostic dump.
+  last success/error, and independent ordinary, AirPrint, and IPP Everywhere
+  profile readiness/reasons. Linux `avahi` builds add only a small aggregate
+  `mdns.state` entry; detailed mDNS state is available through the signal
+  diagnostic dump.
 - A required inactive queue returns 503; an inactive optional queue does not.
 - Defaults: 1 MiB envelope, 1 GiB document, 32 MiB upstream response, two
   concurrent payload submissions per queue, and 30-day terminal retention.
@@ -219,30 +227,33 @@ dns_sd:
   mode: auto        # auto | off
   hostname: ""      # optional override
   interface: ""     # optional interface name
+  allowed_aliases: [] # optional alternate public endpoint hosts
 
 printers:
   office:
-    ipp_everywhere_mode: auto  # disabled | auto | required
+    ipp_everywhere_mode: auto  # disabled | auto; required is legacy -> auto
+    airprint_mode: auto        # disabled | auto
     dns_sd: true
     geo_location: ""
 ```
 
 Linux builds with the `avahi` tag use the system D-Bus Avahi API. Other builds
-use the stub. Eligible queues publish plaintext `_ipp._tcp`, the `_print` and
-`_universal` subtypes, and legacy `_printer._tcp` on port zero. Public IPPS
-publication is deferred until the proxy has a TLS listener and certificate
+use the stub. Eligible queues publish plaintext `_ipp._tcp`, the profile-gated
+`_print`/`_universal` subtypes, and legacy `_printer._tcp` on port zero. Public
+IPPS publication is deferred until the proxy has a TLS listener and certificate
 configuration.
 TXT is synthesized only from filtered proxy capabilities and excludes
-`application/octet-stream` from `pdl` (the IPP format list may still retain it
-for ordinary IPP clients). Entries use the PWG priority order, keep `rp` in the
-first 400 bytes, and enforce the per-entry and multicast aggregate limits.
-Publication uses bounded collision names and retries, updates entry groups,
-records the actual DNS-SD name, and withdraws on shutdown or lost eligibility.
+`application/octet-stream` from both `pdl` and payload admission. Entries use
+the PWG priority order, keep `rp` in the first 400 bytes, and enforce the
+per-entry and multicast aggregate limits. If an optional profile's essential
+TXT data cannot fit, only that profile is withdrawn. Publication uses bounded
+collision names and retries, records the actual DNS-SD name, and rebuilds the
+Avahi entry group when subtype topology changes.
 A valid upstream `printer-geo-location` wins;
 the per-queue override is the fallback for a LOC record. TXT capability updates
-are applied to the existing Avahi entry group; endpoint/interface/LOC changes
-require a proxy restart so a failed refresh cannot destroy the last good
-structural publication.
+are applied to the existing Avahi entry group; subtype changes rebuild the
+group, while endpoint/interface/LOC changes retain the publisher's established
+identity until a safe rebuild.
 
 The official Linux Make target and Docker build enable `avahi`. The default
 Compose file intentionally does not mount the host system bus; deployments must

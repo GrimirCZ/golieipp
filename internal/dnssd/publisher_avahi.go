@@ -75,9 +75,18 @@ func (p *avahiPublisher) Update(ctx context.Context, input ServiceInput) (Status
 	if input.Interface == "" {
 		input.Interface = p.cfg.Interface
 	}
-	records, err := BuildRecords(input)
+	var records []ServiceRecord
+	var err error
+	if input.ProfilesSet {
+		records, err = BuildRecordsForProfiles(input, input.Profiles)
+	} else {
+		records, err = BuildRecords(input)
+	}
 	if err != nil {
 		return Status{State: StateDegraded, Name: input.Name, Err: err}, err
+	}
+	if input.ProfilesSet && input.Profiles.Ordinary {
+		input.Profiles = publicationProfilesForRecords(records)
 	}
 
 	p.mu.Lock()
@@ -85,6 +94,20 @@ func (p *avahiPublisher) Update(ctx context.Context, input ServiceInput) (Status
 	if p.closed {
 		err := errors.New("DNS-SD publisher is closed")
 		return Status{State: StateDegraded, Name: input.Name, Err: err}, err
+	}
+	if input.ProfilesSet && !input.Profiles.Ordinary {
+		name := input.Name
+		if p.current != nil {
+			name = p.current.Name
+		}
+		if p.group != "" {
+			if err := p.freeGroupBounded(ctx, p.group); err != nil && !isStaleEntryGroupError(err) {
+				return Status{State: StateDegraded, Name: name, Err: err}, nil
+			}
+		}
+		p.group = ""
+		p.current = nil
+		return Status{State: StateWithdrawn, Name: name}, nil
 	}
 	if p.cfg.Mode == config.DNSModeOff {
 		if p.group != "" {
@@ -110,28 +133,44 @@ func (p *avahiPublisher) Update(ctx context.Context, input ServiceInput) (Status
 	}
 	if p.current != nil {
 		input.Name = p.current.Name
-		// LOC and endpoint records are established with the EntryGroup. Runtime
-		// refreshes update TXT atomically; structural DNS changes take effect on
-		// publisher restart rather than leaving the in-memory snapshot ahead of
-		// what Avahi actually serves.
+		// Keep the collision-resolved service identity stable. Endpoint, LOC, and
+		// subtype topology are compared below; TXT-only changes can use Avahi's
+		// atomic UpdateServiceTxt path.
 		input.Hostname = p.current.Input.Hostname
 		input.Port = p.current.Input.Port
 		input.IPPS = p.current.Input.IPPS
 		input.Interface = p.current.Input.Interface
 		input.GeoLocation = p.current.Input.GeoLocation
+		if input.ProfilesSet {
+			records, err = BuildRecordsForProfiles(input, input.Profiles)
+		} else {
+			records, err = BuildRecords(input)
+		}
+		if err != nil {
+			return Status{State: StateDegraded, Name: input.Name, Err: err}, nil
+		}
+		if input.ProfilesSet {
+			input.Profiles = publicationProfilesForRecords(records)
+		}
+		if p.group != "" && !samePublicationStructure(p.current.Records, records) {
+			// A subtype is part of the EntryGroup topology, not a TXT field.
+			// Rebuild the group so profile transitions really add/remove the
+			// registration. Freeing the old group first avoids a same-name Avahi
+			// collision; a failed create is reported as degraded and retried by
+			// the service lifecycle.
+			if err := p.freeGroupBounded(ctx, p.group); err != nil && !isStaleEntryGroupError(err) {
+				return Status{State: StateDegraded, Name: p.current.Name, Err: err}, nil
+			}
+			p.group = ""
+			p.current = nil
+		}
 	}
 	if err := p.ensureBus(); err != nil {
 		return Status{State: StateDegraded, Name: input.Name, Err: err}, nil
 	}
 	if p.group != "" && p.current != nil {
-		// Service identity and endpoint are configuration-owned and stable for
-		// the lifetime of a publisher. Capability refreshes only replace TXT.
-		// Avahi requires UpdateServiceTxt on the existing EntryGroup; the
-		// AVAHI_PUBLISH_UPDATE flag is not a cross-group replacement primitive.
-		records, err = BuildRecords(input)
-		if err != nil {
-			return Status{State: StateDegraded, Name: p.current.Name, Err: err}, nil
-		}
+		// The structural identity has already been compared above. At this point
+		// only TXT may differ, so update the existing group atomically.
 		if err := p.updateGroupTXT(ctx, input, records); err != nil {
 			currentName := input.Name
 			if p.current != nil {

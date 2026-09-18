@@ -125,6 +125,18 @@ func ValidateProtocolRequest(msg *goipp.Message, printerURI string, hasPayload b
 	return nil
 }
 
+func validateExplicitDocumentFormat(attrs goipp.Attributes) *ProtocolError {
+	attr, ok := iattr.Attr(attrs, "document-format")
+	if !ok || len(attr.Values) != 1 || attr.Values[0].T != goipp.TagMimeType {
+		return &ProtocolError{Status: goipp.StatusErrorBadRequest, Message: "document-format is required for a payload-bearing operation", Unsupported: attrsNamed(attrs, "document-format")}
+	}
+	value, ok := attr.Values[0].V.(goipp.String)
+	if !ok || strings.TrimSpace(string(value)) == "" {
+		return &ProtocolError{Status: goipp.StatusErrorAttributesOrValues, Message: "document-format has invalid value syntax", Unsupported: goipp.Attributes{attr}}
+	}
+	return nil
+}
+
 func protocolError(status goipp.Status, message string) *ProtocolError {
 	return &ProtocolError{Status: status, Message: message}
 }
@@ -263,6 +275,7 @@ func validateKnownValues(msg *goipp.Message) *ProtocolError {
 		{msg.Operation, "job-uri", goipp.TagURI, true, false},
 		{msg.Operation, "job-id", goipp.TagInteger, true, true},
 		{msg.Operation, "last-document", goipp.TagBoolean, true, false},
+		{msg.Operation, "document-format", goipp.TagMimeType, true, false},
 		{msg.Operation, "ipp-attribute-fidelity", goipp.TagBoolean, true, false},
 		{msg.Operation, "my-jobs", goipp.TagBoolean, true, false},
 		{msg.Operation, "limit", goipp.TagInteger, true, true},
