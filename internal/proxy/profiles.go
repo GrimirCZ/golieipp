@@ -81,6 +81,8 @@ func normalizeAirPrintMode(mode string) string {
 	switch strings.ToLower(strings.TrimSpace(mode)) {
 	case "", config.AirPrintAuto:
 		return config.AirPrintAuto
+	case config.AirPrintEmulateIfMissing:
+		return config.AirPrintEmulateIfMissing
 	default:
 		return strings.ToLower(strings.TrimSpace(mode))
 	}
@@ -272,6 +274,7 @@ func evaluateCapabilityProfiles(upstream goipp.Attributes, printer config.Printe
 	identityReady := usableProfileIdentity(proxyURI)
 	baseline := hasProfileOperation(operations, goipp.OpGetPrinterAttributes) && hasProfileOperation(operations, goipp.OpPrintJob)
 	claimReady, claimReason := ippEverywhereClaimEligibility(upstream)
+	routes := buildRouteSnapshot(upstream, policy, printer)
 
 	if !profiles.AirPrint.Enabled {
 		profiles.AirPrint.Reason = "disabled by configuration (airprint_mode=disabled)"
@@ -285,13 +288,13 @@ func evaluateCapabilityProfiles(upstream goipp.Attributes, printer config.Printe
 			profiles.AirPrint.Reason = "configured media is not supported by upstream"
 		case !identityReady:
 			profiles.AirPrint.Reason = "proxy printer identity is unavailable"
-		case !validURFFamily(upstream):
-			profiles.AirPrint.Reason = "upstream does not provide a valid image/urf family"
+		case routes.AirPrintPath == AirPrintPathUnavailable:
+			profiles.AirPrint.Reason = routes.Reason
 		default:
 			profiles.AirPrint.Ready = true
-			if strings.EqualFold(strings.TrimSpace(policy.PrintColorMode), "monochrome") && urfHasColorSpaces(upstream) {
+			if routes.AirPrintPath == AirPrintPathNative && strings.EqualFold(strings.TrimSpace(policy.PrintColorMode), "monochrome") && urfHasColorSpaces(upstream) {
 				profiles.AirPrint.Warnings = append(profiles.AirPrint.Warnings,
-					"upstream URF advertises color-coded values while policy is monochrome; retaining URF bytes and enforcing monochrome IPP attributes")
+					"upstream URF advertises color-coded values while policy is monochrome; the client view retains only policy-compatible URF tokens")
 			}
 		}
 	}

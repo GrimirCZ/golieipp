@@ -701,7 +701,10 @@ type CapabilityModel struct {
 	// used by the service publication path. IPPEligible/IPPFeatures remain for
 	// source compatibility with the original capability helper; service-owned
 	// advertisements use Profiles rather than trusting an upstream claim.
-	Profiles   CapabilityProfiles
+	Profiles CapabilityProfiles
+	// Routes is the immutable client-to-upstream document routing snapshot.
+	// It is committed with the same upstream capability epoch as Attributes.
+	Routes     RouteSnapshot
 	Warnings   []string
 	Attributes goipp.Attributes
 
@@ -814,6 +817,7 @@ func SynthesizeCapabilityModel(model CapabilityModel) CapabilityModel {
 	model.Operations = uniqueOperations(model.Operations)
 	model.RequiredOperations = append([]goipp.Op(nil), ippEverywhereRequiredOperations...)
 	model.RequiredUnsatisfied = missingOperations(model.Operations, model.RequiredOperations)
+	model.Routes = buildRouteSnapshot(model.Upstream, model.Policy, model.Printer)
 	model.Profiles = evaluateCapabilityProfiles(model.Upstream, model.Printer, model.Policy, model.Operations, model.ProxyURI, model.Disabled)
 	model.Warnings = append(model.Warnings, model.Profiles.Warnings()...)
 	// Eligibility deliberately trusted the upstream claim in the original
@@ -1024,7 +1028,9 @@ func synthesizePrinterAttributes(model CapabilityModel) goipp.Attributes {
 		)
 	}
 	out = append(out, filteredReadyAttributes(upstream, catalog, printer.Policy)...)
-	out = append(out, synthesizedFormatAttributes(upstream, printer.Policy, model.IPPFeatures, model.IPPEligible)...)
+	formatAttrs := synthesizedFormatAttributes(upstream, printer.Policy, model.IPPFeatures, model.IPPEligible)
+	formatAttrs = applyRouteCapabilities(formatAttrs, model)
+	out = append(out, formatAttrs...)
 	if len(model.IPPFeatures) > 0 {
 		out = append(out, iattr.Keywords("ipp-features-supported", model.IPPFeatures...))
 	}

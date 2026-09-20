@@ -34,6 +34,20 @@ func TestPrinterDNSSDTXTDerivedFromFilteredCapabilities(t *testing.T) {
 	}
 }
 
+func TestPrinterDNSSDTXTIncludesSynthesizedGrayscaleURF(t *testing.T) {
+	attrs := goipp.Attributes{
+		goipp.MakeAttr("document-format-supported", goipp.TagMimeType, goipp.String("image/urf")),
+		iattr.Keywords("urf-supported", "V1.4", "W8", "RS300"),
+	}
+	txt := printerDNSSDTXTForProfiles("printers/mono", "Mono", "", attrs, CapabilityProfiles{
+		Ordinary: CapabilityProfile{Ready: true},
+		AirPrint: CapabilityProfile{Ready: true},
+	})
+	if got := txt["URF"]; got != "V1.4,W8,RS300" {
+		t.Fatalf("synthesized grayscale URF = %q, want V1.4,W8,RS300", got)
+	}
+}
+
 func TestDNSServiceInputUsesPublicPathAndPlaintextTXT(t *testing.T) {
 	printer := config.PrinterConfig{
 		DisplayName:       "Office",

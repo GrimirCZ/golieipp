@@ -189,10 +189,21 @@ Use the output to fill:
   The legacy value `required` is accepted, normalized to `auto`, and logged as
   a migration warning. A formal IPP Everywhere conformance suite is not run at
   runtime.
-- `printers.<queue>.airprint_mode`: `auto` publishes the AirPrint subtype only
-  when a valid upstream `image/urf` family and usable proxy policy are present;
-  `disabled` withdraws only AirPrint. Monochrome policy still preserves valid
-  upstream URF values while advertising `Color=F`.
+- `printers.<queue>.airprint_mode`: `disabled` withdraws only AirPrint;
+  `auto` is native-only and publishes the AirPrint subtype only when a valid
+  upstream `image/urf` family and usable proxy policy are present;
+  `emulate-if-missing` opts in to the practical URF-to-PWG bridge when native
+  URF is absent but the upstream exposes an eligible PWG Raster family. Native
+  URF remains preferred when both routes are available. Emulated documents
+  are fully staged before dispatch, so temporary storage and translation
+  limits are part of the queue's capacity planning. A selected route stores
+  the client and upstream formats plus normalized media, resolution, quality,
+  sides, and sheet-back values in SQLite; a capability refresh or restart
+  between `Create-Job` and `Send-Document` therefore cannot silently switch
+  the route. Monochrome policy still preserves valid upstream URF values while
+  advertising `Color=F`. For an opted-in color policy, emulation selects the
+  exact `SRGB24` to `srgb_8` mapping when available and otherwise the exact
+  `DEVRGB24` to `rgb_8` mapping; it does not convert or resample pixels.
 - `printers.<queue>.dns_sd`: opt a queue out of DNS-SD while retaining ordinary
   IPP. Avahi loss is reported as degraded and retried; it never deactivates an
   otherwise usable queue.

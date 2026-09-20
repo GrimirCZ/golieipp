@@ -58,11 +58,58 @@ func printerDNSSDTXTForProfiles(resourcePath, name, location string, attrs goipp
 		txt["product"] = "(" + model + ")"
 	}
 	if profiles.AirPrint.Ready {
-		if urf := stringValues(attrs, "urf-supported"); len(urf) > 0 && validURFFamily(attrs) {
+		if urf := stringValues(attrs, "urf-supported"); len(urf) > 0 && validAdvertisedURFFamily(attrs) {
 			txt["URF"] = strings.Join(urf, ",")
 		}
 	}
 	return txt
+}
+
+// validAdvertisedURFFamily accepts the strict upstream family as well as the
+// proxy's synthesized grayscale form. A synthesized W8 route intentionally
+// has no separate color-space token: W8 itself is the selected grayscale
+// flavor, and adding a color token would advertise a mapping the policy did
+// not admit.
+func validAdvertisedURFFamily(attrs goipp.Attributes) bool {
+	if validURFFamily(attrs) {
+		return true
+	}
+	formats, ok := iattr.Attr(attrs, "document-format-supported")
+	if !ok || !hasMimeTypeValue(formats, "image/urf") {
+		return false
+	}
+	attr, ok := iattr.Attr(attrs, "urf-supported")
+	if !ok || len(attr.Values) == 0 {
+		return false
+	}
+	width, resolution := false, false
+	tokens := 0
+	for _, value := range attr.Values {
+		if value.T != goipp.TagKeyword {
+			return false
+		}
+		text, ok := value.V.(goipp.String)
+		if !ok {
+			return false
+		}
+		parts, valid := splitURFTokens(string(text))
+		if !valid {
+			return false
+		}
+		for _, token := range parts {
+			tokens++
+			switch {
+			case urfResolutionToken.MatchString(token):
+				resolution = true
+			case urfWidthToken.MatchString(token):
+				width = true
+			case urfColorSpaceToken.MatchString(token), urfVersionToken.MatchString(token), urfPositiveNumericListToken.MatchString(token), urfOptionalZeroToken.MatchString(token):
+			default:
+				return false
+			}
+		}
+	}
+	return tokens >= 2 && width && resolution
 }
 
 func stringValues(attrs goipp.Attributes, name string) []string {

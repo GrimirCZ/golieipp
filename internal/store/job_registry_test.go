@@ -89,6 +89,91 @@ func TestJobRegistryReservationAndStateTransitions(t *testing.T) {
 	}
 }
 
+func TestJobRegistryPersistsSelectedDocumentRoute(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "jobs.db")
+	ctx := context.Background()
+	route := DocumentRoute{
+		ClientDocumentFormat:   "image/urf",
+		UpstreamDocumentFormat: "image/pwg-raster",
+		Kind:                   RouteURFToPWG,
+		Mapping:                "W8->sgray_8",
+		MediaName:              "iso_a4_210x297mm",
+		MediaWidth:             21000,
+		MediaHeight:            29700,
+		MediaType:              "stationery",
+		MediaSource:            7,
+		ResolutionX:            600,
+		ResolutionY:            600,
+		PrintQuality:           5,
+		Sides:                  "two-sided-long-edge",
+		SheetBack:              "flipped",
+	}
+
+	s, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := s.Reserve(ctx, Job{Queue: "office", RequestingUser: "alice", Route: route})
+	if err != nil {
+		s.Close()
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err = Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	job, err := s.GetByProxyID(ctx, "office", id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := job.Route
+	if got != route {
+		t.Fatalf("selected route changed across restart: got %+v, want %+v", got, route)
+	}
+	if job.DocumentFormat != route.ClientDocumentFormat || job.UpstreamDocumentFormat != route.UpstreamDocumentFormat {
+		t.Fatalf("document formats were not retained: %+v", job)
+	}
+
+	updated := route
+	updated.ResolutionX = 300
+	updated.ResolutionY = 300
+	updated.SheetBack = "normal"
+	if err := s.UpdateRoute(ctx, "office", id, updated); err != nil {
+		t.Fatal(err)
+	}
+	gotRoute, err := s.SelectedRoute(ctx, "office", id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotRoute != updated {
+		t.Fatalf("updated route was not retained: got %+v, want %+v", gotRoute, updated)
+	}
+}
+
+func TestJobRegistryRouteUpdateRejectsTerminalJob(t *testing.T) {
+	s, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	id, err := s.Reserve(ctx, Job{Queue: "office", DocumentFormat: "image/urf"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkTerminal(ctx, id, "completed", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateRoute(ctx, "office", id, DocumentRoute{ClientDocumentFormat: "image/urf", UpstreamDocumentFormat: "image/pwg-raster", Kind: RouteURFToPWG}); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("terminal route update error = %v, want ErrInvalidTransition", err)
+	}
+}
+
 func TestJobRegistryMigrationMakesLegacyUpstreamFieldsNullable(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "jobs.db")
 	db, err := sql.Open("sqlite", dbPath)
@@ -112,8 +197,8 @@ CREATE TABLE jobs (
 	created_at TEXT NOT NULL,
 	updated_at TEXT NOT NULL
 );
-INSERT INTO jobs (proxy_job_id, upstream_job_id, upstream_job_uri, queue, requesting_user, state, created_at, updated_at)
-VALUES (7, 91, 'ipp://legacy/jobs/91', 'legacy', 'bob', 'submitted', '2025-01-02T03:04:05Z', '2025-01-02T03:04:05Z');`)
+INSERT INTO jobs (proxy_job_id, upstream_job_id, upstream_job_uri, queue, requesting_user, document_format, state, created_at, updated_at)
+VALUES (7, 91, 'ipp://legacy/jobs/91', 'legacy', 'bob', 'application/pdf', 'submitted', '2025-01-02T03:04:05Z', '2025-01-02T03:04:05Z');`)
 	if err != nil {
 		db.Close()
 		t.Fatal(err)
@@ -135,6 +220,9 @@ VALUES (7, 91, 'ipp://legacy/jobs/91', 'legacy', 'bob', 'submitted', '2025-01-02
 	if legacy.UpstreamJobID != 91 || !legacy.HasUpstreamJobID || legacy.UpstreamJobURI != "ipp://legacy/jobs/91" || !legacy.HasUpstreamJobURI {
 		t.Fatalf("legacy row was not preserved: %+v", legacy)
 	}
+	if legacy.UpstreamDocumentFormat != "application/pdf" || legacy.RouteKind != RoutePassThrough {
+		t.Fatalf("legacy route was not defaulted to pass-through: %+v", legacy)
+	}
 
 	reservedID, err := s.Reserve(context.Background(), Job{Queue: "legacy", RequestingUser: "bob"})
 	if err != nil {
@@ -154,6 +242,69 @@ VALUES (7, 91, 'ipp://legacy/jobs/91', 'legacy', 'bob', 'submitted', '2025-01-02
 	}
 	if notNull != 0 {
 		t.Fatalf("upstream_job_id remains NOT NULL after migration")
+	}
+}
+
+func TestJobRegistryMigrationBackfillsRoutesOnNullableLegacySchema(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "jobs.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`
+CREATE TABLE jobs (
+	proxy_job_id INTEGER PRIMARY KEY AUTOINCREMENT,
+	upstream_job_id INTEGER,
+	upstream_job_uri TEXT,
+	queue TEXT NOT NULL,
+	queue_owner TEXT NOT NULL DEFAULT '',
+	requesting_user TEXT NOT NULL DEFAULT '',
+	job_name TEXT NOT NULL DEFAULT '',
+	document_format TEXT NOT NULL DEFAULT '',
+	state TEXT NOT NULL DEFAULT '',
+	observed_state TEXT NOT NULL DEFAULT '',
+	observed_error TEXT NOT NULL DEFAULT '',
+	payload_bytes INTEGER NOT NULL DEFAULT 0,
+	page_count INTEGER,
+	copies INTEGER NOT NULL DEFAULT 1,
+	estimated_impressions INTEGER,
+	document_count INTEGER NOT NULL DEFAULT 0,
+	last_document INTEGER NOT NULL DEFAULT 0,
+	created_at TEXT NOT NULL,
+	updated_at TEXT NOT NULL,
+	terminal_at TEXT,
+	reconcile_at TEXT,
+	last_reconcile_at TEXT,
+	next_reconcile_at TEXT
+);
+INSERT INTO jobs (proxy_job_id, upstream_job_id, upstream_job_uri, queue, document_format, state, created_at, updated_at)
+VALUES (8, 92, 'ipp://legacy/jobs/92', 'legacy', 'image/urf', 'mapped', '2025-01-02T03:04:05Z', '2025-01-02T03:04:05Z');`)
+	if err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	job, err := s.GetByProxyID(context.Background(), "legacy", 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.UpstreamDocumentFormat != "image/urf" || job.RouteKind != RoutePassThrough {
+		t.Fatalf("nullable legacy route was not backfilled: %+v", job)
+	}
+	var routeColumns int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('jobs') WHERE name IN ('upstream_document_format','route_kind','route_sheet_back')`).Scan(&routeColumns); err != nil {
+		t.Fatal(err)
+	}
+	if routeColumns != 3 {
+		t.Fatalf("route columns = %d, want 3", routeColumns)
 	}
 }
 

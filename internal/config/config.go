@@ -62,9 +62,14 @@ const (
 
 	AirPrintDisabled = "disabled"
 	AirPrintAuto     = "auto"
+	// AirPrintEmulateIfMissing enables the proxy's exact URF-to-PWG adapter
+	// when the upstream queue does not expose a usable native URF family.
+	// Native URF remains preferred whenever it is available.
+	AirPrintEmulateIfMissing = "emulate-if-missing"
 
-	AirPrintModeDisabled = AirPrintDisabled
-	AirPrintModeAuto     = AirPrintAuto
+	AirPrintModeDisabled         = AirPrintDisabled
+	AirPrintModeAuto             = AirPrintAuto
+	AirPrintModeEmulateIfMissing = AirPrintEmulateIfMissing
 )
 
 type DNSSDConfig struct {
@@ -671,7 +676,7 @@ func validIPPEverywhereMode(mode string) bool {
 
 func validAirPrintMode(mode string) bool {
 	switch mode {
-	case AirPrintDisabled, AirPrintAuto:
+	case AirPrintDisabled, AirPrintAuto, AirPrintEmulateIfMissing:
 		return true
 	default:
 		return false
