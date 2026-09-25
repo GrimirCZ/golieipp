@@ -3,6 +3,21 @@ listen:
   public_base_url: "ipp://print-proxy.example.cz:8631/printers"
 storage:
   sqlite_path: "jobs.db"
+statistics:
+  # Separate from the job registry; reports also work while printing is running.
+  enabled: true
+  sqlite_path: "jobs.db.stats.sqlite"
+  # Zero retention means indefinitely. Daily rollups survive detail cleanup.
+  detail_retention: "90d"
+  cpu_retention: "30d"
+  rollup_retention: "0"
+  queue_size: 4096
+  batch_size: 256
+  flush_interval: "1s"
+  # Explicit buffer/temp-file accounting and aggregate CPU at action boundaries.
+  # Neither option starts a periodic resource sampler.
+  resources: true
+  cpu: true
 defaults:
   max_envelope_bytes: "1MiB"
   max_document_bytes: "1GiB"

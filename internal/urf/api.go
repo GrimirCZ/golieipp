@@ -63,9 +63,28 @@ type Result struct {
 	Pages       uint32
 }
 
+// ResourceLease represents an explicitly tracked translator resource. The
+// translator always releases leases on both success and error paths. Written
+// counts physical writes, including overwrites; SetSize records logical file
+// size for temporary output resources.
+type ResourceLease interface {
+	SetSize(int64)
+	Written(int64)
+	Release()
+}
+
+// ResourceObserver receives bounded translator resource usage. It is optional
+// and deliberately uses a small lease interface so the urf package does not
+// depend on the proxy's statistics implementation.
+type ResourceObserver interface {
+	AcquireBuffer(component string, capacity int64) ResourceLease
+	AcquireTemp(component string, logicalSize int64) ResourceLease
+}
+
 // Options controls one translation.
 type Options struct {
-	Mapping Mapping
-	Page    PageSettings
-	Limits  Limits
+	Mapping  Mapping
+	Page     PageSettings
+	Limits   Limits
+	Observer ResourceObserver
 }

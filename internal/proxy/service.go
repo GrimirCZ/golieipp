@@ -24,6 +24,7 @@ import (
 	"github.com/grimir/golieipp/internal/config"
 	"github.com/grimir/golieipp/internal/dnssd"
 	iattr "github.com/grimir/golieipp/internal/ipp"
+	"github.com/grimir/golieipp/internal/stats"
 	"github.com/grimir/golieipp/internal/store"
 )
 
@@ -32,6 +33,11 @@ type Service struct {
 	store           *store.Store
 	upstream        *UpstreamClient
 	logger          *slog.Logger
+	statistics      *stats.Collector
+	statisticsID    string
+	statsActive     atomic.Int64
+	statsUserMu     sync.Mutex
+	statsUsers      map[string]int64
 	nextID          atomic.Uint64
 	startedAt       time.Time
 	configChangedAt map[string]time.Time
@@ -54,23 +60,24 @@ type Service struct {
 }
 
 type queueHealth struct {
-	OrdinaryReady       bool
-	AirPrintReady       bool
-	AirPrintReason      string
-	IPPEverywhereReady  bool
-	IPPEverywhereReason string
-	ProfileWarnings     []string
-	LastSuccess         time.Time
-	LastAttempt         time.Time
-	LastError           string
-	DNSDegraded         bool
-	DNSState            string
-	DNSName             string
-	DNSLastAttempt      time.Time
-	DNSLastPublished    time.Time
-	DNSLastError        string
-	DNSAttempts         int
-	IPPEligible         bool
+	OrdinaryReady        bool
+	AirPrintReady        bool
+	AirPrintReason       string
+	IPPEverywhereReady   bool
+	IPPEverywhereReason  string
+	ProfileWarnings      []string
+	LastSuccess          time.Time
+	LastAttempt          time.Time
+	LastError            string
+	DNSDegraded          bool
+	DNSState             string
+	DNSName              string
+	DNSLastAttempt       time.Time
+	DNSLastPublished     time.Time
+	DNSLastError         string
+	DNSAttempts          int
+	IPPEligible          bool
+	LastTranslationError string
 }
 
 type readinessResponse struct {
@@ -311,15 +318,29 @@ func (s *Service) StartMaintenanceLoop(ctx context.Context) {
 }
 
 func (s *Service) runMaintenance(ctx context.Context) {
+	ctx, span := s.statsBackground(ctx, "maintenance", "maintenance", "")
+	span.SetOutcome("success")
+	defer span.Finish("")
+	s.statistics.Cleanup(time.Now().UTC())
 	if _, err := s.store.CleanupExpired(ctx, time.Now().UTC(), s.cfg.Defaults.JobRetention); err != nil {
+		span.SetOutcome("error")
 		s.logger.Warn("job retention cleanup failed", "error", err)
 	}
 	if err := s.reconcileUncertainJobs(ctx); err != nil {
+		span.SetOutcome("error")
 		s.logger.Warn("uncertain job reconciliation failed", "error", err)
 	}
 }
 
-func (s *Service) reconcileUncertainJobs(ctx context.Context) error {
+func (s *Service) reconcileUncertainJobs(ctx context.Context) (retErr error) {
+	ctx, span := s.statsBackground(ctx, "reconciliation", "reconcile jobs", "")
+	span.SetOutcome("success")
+	defer func() {
+		if retErr != nil {
+			span.SetOutcome("error")
+		}
+		span.Finish("")
+	}()
 	candidates, err := s.store.ReconciliationCandidates(ctx, time.Now().UTC(), 100)
 	if err != nil {
 		return err
@@ -335,6 +356,18 @@ func (s *Service) reconcileUncertainJobs(ctx context.Context) error {
 	for _, job := range mapped {
 		byQueue[job.Queue] = append(byQueue[job.Queue], job)
 	}
+	// Accepted cancellation makes the primary registry terminal immediately.
+	// Give recent cancellations two normal maintenance intervals to collect
+	// genuine printer output counters without changing that registry behavior.
+	if s.statistics.Enabled() {
+		canceled, cancelErr := s.store.ListJobs(ctx, store.JobFilter{State: store.StateCanceled, TerminalAfter: time.Now().UTC().Add(-10 * time.Minute)})
+		if cancelErr != nil {
+			return cancelErr
+		}
+		for _, job := range canceled {
+			byQueue[job.Queue] = append(byQueue[job.Queue], job)
+		}
+	}
 	for queue, jobs := range byQueue {
 		printer, configured := s.cfg.Printers[queue]
 		if !configured || !s.printerAvailable(queue) {
@@ -345,10 +378,13 @@ func (s *Service) reconcileUncertainJobs(ctx context.Context) error {
 			iattr.Keyword("which-jobs", "all"),
 			goipp.MakeAttr("requested-attributes", goipp.TagKeyword,
 				goipp.String("job-id"), goipp.String("job-uri"), goipp.String("job-name"),
-				goipp.String("job-originating-user-name"), goipp.String("job-state"), goipp.String("job-state-reasons")),
+				goipp.String("job-originating-user-name"), goipp.String("job-state"), goipp.String("job-state-reasons"),
+				goipp.String("job-impressions-completed"), goipp.String("job-media-sheets-completed")),
 		)
 		response, requestErr := s.upstream.Do(ctx, printer.UpstreamURI, request, nil)
 		if requestErr != nil || !ippSuccess(response) {
+			span.SetOutcome("error")
+			span.SetReason("upstream-job-query")
 			continue
 		}
 		upstreamJobs := responseJobGroups(response)
@@ -361,6 +397,10 @@ func (s *Service) reconcileUncertainJobs(ctx context.Context) error {
 					upstreamID, ok := iattr.FirstInt(attrs, "job-id")
 					if !ok || upstreamID != job.UpstreamJobID || !sameReconciledJob(job, attrs) {
 						continue
+					}
+					if store.IsTerminalState(job.State) {
+						s.statsResponse(queue, job.ProxyJobID, attrs, true, job.State == store.StateCanceled)
+						break
 					}
 					if mapErr := s.store.MarkMapped(ctx, queue, job.ProxyJobID, job.UpstreamJobID, job.UpstreamJobURI); mapErr == nil {
 						s.syncObservedJob(ctx, queue, job, attrs)
@@ -480,14 +520,63 @@ func (s *Service) upstreamCapabilities(queue string) goipp.Attributes {
 }
 
 func (s *Service) logPrinterAvailable(queue string, printer config.PrinterConfig) {
+	s.mu.RLock()
+	model, ok := s.capabilityModels[queue]
+	s.mu.RUnlock()
+	path := AirPrintPathUnavailable
+	reason := "capabilities are not available"
+	var tokens []string
+	var mappings []string
+	var resolutions []uint32
+	if ok {
+		path = model.Routes.AirPrintPath
+		reason = model.Routes.Reason
+		tokens = append([]string(nil), model.Routes.URFTokens...)
+		for _, route := range model.Routes.Routes {
+			if route.Transform {
+				mappings = append(mappings, route.Mapping.String())
+				resolutions = append(resolutions, route.Resolutions...)
+			}
+		}
+	}
 	s.logger.Info("printer available",
 		"queue", queue,
 		"display_name", printer.DisplayName,
 		"printer_url", s.proxyPrinterURI(queue),
+		"airprint_path", path,
+		"airprint_reason", reason,
+		"airprint_urf", strings.Join(tokens, ","),
+		"airprint_mappings", uniqueUintStrings(mappings),
+		"airprint_resolutions", resolutions,
 	)
 }
 
+func uniqueUintStrings(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	return result
+}
+
 func (s *Service) refreshOne(ctx context.Context, queue string, printer config.PrinterConfig) (retErr error) {
+	ctx, span := s.statsBackground(ctx, "refresh", "refresh capabilities", queue)
+	wasAvailable := s.printerAvailable(queue)
+	defer func() {
+		span.Finish(outcomeForError(retErr))
+		if nowAvailable := s.printerAvailable(queue); nowAvailable != wasAvailable {
+			outcome := "unavailable"
+			if nowAvailable {
+				outcome = "available"
+			}
+			s.statistics.RecordAction(stats.Action{Kind: "availability", Operation: "printer availability", Queue: queue, Outcome: outcome})
+		}
+	}()
 	start := time.Now()
 	s.mu.Lock()
 	s.refreshing[queue] = true
@@ -691,6 +780,8 @@ func (s *Service) readyz(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Service) ippHandler(w http.ResponseWriter, r *http.Request) {
+	w, r, finishStatistics := s.statsRequest(w, r)
+	defer finishStatistics()
 	traceID, _ := r.Context().Value(traceIDContextKey{}).(uint64)
 	if traceID == 0 {
 		traceID = s.nextID.Add(1)
@@ -746,6 +837,11 @@ func (s *Service) ippHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	documentMax := s.cfg.Defaults.MaxDocumentBytes
+	if span := stats.SpanFromContext(r.Context()); span != nil {
+		span.SetOperation(goipp.Op(req.Code).String())
+		user, _ := iattr.FirstString(req.Operation, "requesting-user-name")
+		defer s.statsUser(r.Context(), user)()
+	}
 	if documentMax <= 0 {
 		documentMax = 1 << 30
 	}
@@ -759,7 +855,14 @@ func (s *Service) ippHandler(w http.ResponseWriter, r *http.Request) {
 		s.writeIPPError(w, closestSupportedVersion(req.Version), req.RequestID, goipp.StatusErrorVersionNotSupported, "IPP version not supported")
 		return
 	}
-	documentReader := bufio.NewReader(&maxBytesReader{Reader: r.Body, Max: documentMax})
+	var payloadSource io.Reader = r.Body
+	if span := stats.SpanFromContext(r.Context()); span != nil {
+		payloadSource = &statisticsReader{Reader: r.Body, span: span}
+	}
+	documentReader := bufio.NewReader(&maxBytesReader{Reader: payloadSource, Max: documentMax})
+	if span := stats.SpanFromContext(r.Context()); span != nil {
+		defer span.AcquireBuffer("client-document-reader", int64(documentReader.Size())).Release()
+	}
 	hasPayload := false
 	if op == goipp.OpPrintJob || op == goipp.OpSendDocument {
 		if _, peekErr := documentReader.Peek(1); peekErr == nil {
@@ -784,15 +887,29 @@ func (s *Service) ippHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if op == goipp.OpPrintJob || (op == goipp.OpSendDocument && hasPayload) {
-		if protocolErr := validateExplicitDocumentFormat(req.Operation); protocolErr != nil {
+		// Print-Job always carries its own format. Send-Document may omit it
+		// after Create-Job; in that form the durable route pinned at creation
+		// supplies the format and survives capability refreshes.
+		if op == goipp.OpPrintJob {
+			if protocolErr := validateExplicitDocumentFormat(req.Operation); protocolErr != nil {
+				logger.Warn("ipp request rejected", "reason", "document_format_required", "error", protocolErr)
+				s.writeIPPProtocolError(w, req.Version, req.RequestID, protocolErr)
+				return
+			}
+		}
+		format, present := iattr.FirstString(req.Operation, "document-format")
+		if (op == goipp.OpPrintJob || present) && strings.TrimSpace(format) == "" {
+			protocolErr := &ProtocolError{Status: goipp.StatusErrorDocumentFormatNotSupported, Message: "document-format is not admitted for a payload-bearing operation", Unsupported: attrsNamed(req.Operation, "document-format")}
 			logger.Warn("ipp request rejected", "reason", "document_format_required", "error", protocolErr)
 			s.writeIPPProtocolError(w, req.Version, req.RequestID, protocolErr)
 			return
 		}
-		if protocolErr := s.validatePayloadDocumentFormat(queue, req); protocolErr != nil {
-			logger.Warn("ipp request rejected", "reason", "document_format_not_admitted", "error", protocolErr)
-			s.writeIPPProtocolError(w, req.Version, req.RequestID, protocolErr)
-			return
+		if op == goipp.OpPrintJob {
+			if protocolErr := s.validatePayloadDocumentFormat(queue, req); protocolErr != nil {
+				logger.Warn("ipp request rejected", "reason", "document_format_not_admitted", "error", protocolErr)
+				s.writeIPPProtocolError(w, req.Version, req.RequestID, protocolErr)
+				return
+			}
 		}
 	}
 	var staged *stagedPayload
@@ -1209,14 +1326,14 @@ func (s *Service) validatePayloadDocumentFormat(queue string, req *goipp.Message
 		return nil
 	}
 
-	formats, present := effectiveFormatSet(model.Upstream, model.Policy)
-	if !present || len(formats) == 0 {
+	routes := routeSnapshotForModel(model)
+	if len(routes.Routes) == 0 {
 		return &ProtocolError{
 			Status:  goipp.StatusErrorDocumentFormatNotSupported,
 			Message: "the proxy has no admitted document formats",
 		}
 	}
-	if _, supported := formats[formatKey]; !supported {
+	if _, supported := routes.routeFor(formatKey); !supported {
 		return &ProtocolError{
 			Status:      goipp.StatusErrorDocumentFormatNotSupported,
 			Message:     fmt.Sprintf("document-format %q is not supported by the proxy", format),
@@ -1391,6 +1508,12 @@ func (s *Service) handleValidateJob(ctx context.Context, queue string, printer c
 	if rejected != nil {
 		return rejected, nil
 	}
+	clientFormat, _ := iattr.FirstString(req.Operation, "document-format")
+	route, routeErr := s.clientRoute(queue, clientFormat, req)
+	if routeErr != nil {
+		return protocolResponse(req, routeErr.Status, routeErr.Message), nil
+	}
+	req.Operation = rewriteDocumentFormat(req.Operation, route.UpstreamFormat)
 	req.Operation = rewriteOperationForUpstream(req.Operation, printer.UpstreamURI)
 	req.Job = normalized.Attrs
 	req.Groups = nil
@@ -1406,6 +1529,11 @@ func (s *Service) handlePrintJob(ctx context.Context, queue string, printer conf
 	if protocolErr := s.validatePayloadDocumentFormat(queue, req); protocolErr != nil {
 		return protocolResponse(req, protocolErr.Status, protocolErr.Message), nil
 	}
+	format, _ := iattr.FirstString(req.Operation, "document-format")
+	route, routeErr := s.clientRoute(queue, format, req)
+	if routeErr != nil {
+		return protocolResponse(req, routeErr.Status, routeErr.Message), nil
+	}
 	normalizedResult, rejected := s.normalizeJobRequest(queue, printer, req)
 	if rejected != nil {
 		return rejected, nil
@@ -1413,28 +1541,66 @@ func (s *Service) handlePrintJob(ctx context.Context, queue string, printer conf
 	normalized, normLog := normalizedResult.Attrs, normalizedResult.Log
 	user, _ := iattr.FirstString(req.Operation, "requesting-user-name")
 	jobName, _ := iattr.FirstString(req.Operation, "job-name")
-	format, _ := iattr.FirstString(req.Operation, "document-format")
 	copies := copiesFromAttrs(normalized)
+	upstreamCapabilities := s.upstreamCapabilities(queue)
+	route.Page = routePageSettings(route, normalized, upstreamCapabilities)
+	translated, translateErr := translatePayload(ctx, payload, route, normalized, upstreamCapabilities, s.cfg.Defaults.MaxDocumentBytes)
+	if translateErr != nil {
+		s.recordTranslationError(queue, translateErr)
+		s.logger.Warn("AirPrint document translation failed",
+			"queue", queue, "job_name", jobName, "document_format", format,
+			"upstream_document_format", route.UpstreamFormat, "error", translateErr)
+		protocolErr := translationErrorProtocol(req, translateErr)
+		return protocolResponse(req, protocolErr.Status, protocolErr.Message), nil
+	}
+	if translated != nil {
+		defer func() {
+			if closeErr := translated.Close(); closeErr != nil {
+				s.logger.Warn("AirPrint translation staging cleanup failed", "queue", queue, "error", closeErr)
+			}
+		}()
+	}
 	proxyID, err := s.store.Reserve(ctx, store.Job{
 		Queue: queue, QueueOwner: queue, RequestingUser: user, JobName: jobName,
-		DocumentFormat: format, Copies: copies,
+		DocumentFormat: format, UpstreamDocumentFormat: route.UpstreamFormat,
+		Route: routeToStore(route), Copies: copies,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("reserve proxy job: %w", err)
 	}
+	s.statsRegister(ctx, queue, proxyID, req.Job, normalized)
+	defer s.statsStored(queue, proxyID)
+	req.Operation = rewriteDocumentFormat(req.Operation, route.UpstreamFormat)
 	req.Operation = rewriteOperationForUpstream(req.Operation, printer.UpstreamURI)
 	req.Job = normalized
 	req.Groups = nil
 
-	recorder, err := newPayloadRecorder(payload)
-	if err != nil {
-		_ = s.store.MarkTerminal(ctx, queue, proxyID, store.StateFailed, "", err.Error())
-		return nil, err
+	var (
+		resp            *goipp.Message
+		meta            PayloadMetadata
+		metaErr         error
+		translatedBytes int64
+		recorder        *payloadRecorder
+	)
+	if translated != nil {
+		translatedBytes = translated.result.OutputBytes
+		pages := int(translated.result.Pages)
+		impressions := pages * copies
+		meta = PayloadMetadata{Bytes: translated.result.InputBytes, PageCount: &pages, Copies: copies, EstimatedImpressions: &impressions}
+		resp, err = s.upstream.Do(ctx, printer.UpstreamURI, req, translated.Reader())
+	} else {
+		recorder, err = newPayloadRecorderContext(ctx, payload)
+		if err != nil {
+			s.recordTranslationError(queue, err)
+			_ = s.store.MarkTerminal(ctx, queue, proxyID, store.StateFailed, "", err.Error())
+			return nil, err
+		}
+		resp, err = s.upstream.Do(ctx, printer.UpstreamURI, req, recorder.Reader())
+		persistFormat := format
+		meta, metaErr = recorder.Finish(persistFormat, copies)
 	}
-	resp, err := s.upstream.Do(ctx, printer.UpstreamURI, req, recorder.Reader())
 	persistCtx, cancelPersist := s.persistenceContext()
 	defer cancelPersist()
-	meta, metaErr := recorder.Finish(format, copies)
 	if metaErr != nil {
 		s.logger.Warn("payload metadata extraction failed", "queue", queue, "job_name", jobName, "error", metaErr)
 	}
@@ -1449,6 +1615,7 @@ func (s *Service) handlePrintJob(ctx context.Context, queue string, printer conf
 			"user", user,
 			"job_name", jobName,
 			"document_format", format,
+			"upstream_document_format", route.UpstreamFormat,
 			"upstream_status", goipp.Status(resp.Code).String(),
 			"status_message", statusMessage(resp),
 			"payload_bytes", meta.Bytes,
@@ -1471,13 +1638,24 @@ func (s *Service) handlePrintJob(ctx context.Context, queue string, printer conf
 		s.logger.Error("critical: upstream accepted job but payload metadata persistence failed", "queue", queue, "proxy_job_id", proxyID, "error", metaErr)
 		_ = s.store.MarkUncertain(persistCtx, queue, proxyID, metaErr.Error())
 	}
+	s.statsResponse(queue, proxyID, resp.Job, true, false)
 	rewriteResponseJob(resp, queue, proxyID, s.proxyPrinterURI(queue))
 	attrs := normLog.Attrs()
 	args := []any{
 		"queue", queue, "user", user, "job_name", jobName, "document_format", format,
+		"upstream_document_format", route.UpstreamFormat,
+		"route_kind", routeKind(route),
 		"upstream_job_id", upstreamJobID, "proxy_job_id", proxyID, "payload_bytes", meta.Bytes,
 		"page_count", nullableLogInt(meta.PageCount), "copies", meta.Copies,
 		"estimated_impressions", nullableLogInt(meta.EstimatedImpressions),
+	}
+	if route.Transform {
+		args = append(args,
+			"translation_input_bytes", meta.Bytes,
+			"translation_output_bytes", translatedBytes,
+			"translation_pages", translated.result.Pages,
+			"translation_duration_ms", translated.duration.Milliseconds(),
+		)
 	}
 	for _, attr := range attrs {
 		args = append(args, attr.Key, attr.Value.Any())
@@ -1495,14 +1673,27 @@ func (s *Service) handleCreateJob(ctx context.Context, queue string, printer con
 	user, _ := iattr.FirstString(req.Operation, "requesting-user-name")
 	jobName, _ := iattr.FirstString(req.Operation, "job-name")
 	format, _ := iattr.FirstString(req.Operation, "document-format")
+	route, routeErr := s.clientRoute(queue, format, req)
+	if routeErr != nil {
+		return protocolResponse(req, routeErr.Status, routeErr.Message), nil
+	}
+	if strings.TrimSpace(format) == "" {
+		format = route.ClientFormat
+	}
+	upstreamCapabilities := s.upstreamCapabilities(queue)
+	route.Page = routePageSettings(route, normalized, upstreamCapabilities)
 	copies := copiesFromAttrs(normalized)
 	proxyID, err := s.store.Reserve(ctx, store.Job{
 		Queue: queue, QueueOwner: queue, RequestingUser: user, JobName: jobName,
-		DocumentFormat: format, Copies: copies,
+		DocumentFormat: format, UpstreamDocumentFormat: route.UpstreamFormat,
+		Route: routeToStore(route), Copies: copies,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("reserve proxy job: %w", err)
 	}
+	s.statsRegister(ctx, queue, proxyID, req.Job, normalized)
+	defer s.statsStored(queue, proxyID)
+	req.Operation = rewriteDocumentFormat(req.Operation, route.UpstreamFormat)
 	req.Operation = rewriteOperationForUpstream(req.Operation, printer.UpstreamURI)
 	req.Job = normalized
 	req.Groups = nil
@@ -1522,6 +1713,8 @@ func (s *Service) handleCreateJob(ctx context.Context, queue string, printer con
 			"user", user,
 			"job_name", jobName,
 			"document_format", format,
+			"upstream_document_format", route.UpstreamFormat,
+			"route_kind", map[bool]string{true: store.RouteURFToPWG, false: store.RoutePassThrough}[route.Transform],
 			"upstream_status", goipp.Status(resp.Code).String(),
 			"status_message", statusMessage(resp),
 			"copies", copies,
@@ -1544,9 +1737,10 @@ func (s *Service) handleCreateJob(ctx context.Context, queue string, printer con
 		s.logger.Error("critical: upstream created job without a job-id", "queue", queue, "proxy_job_id", proxyID)
 		_ = s.store.MarkUncertain(persistCtx, queue, proxyID, "upstream created job without job-id")
 	}
+	s.statsResponse(queue, proxyID, resp.Job, true, false)
 	rewriteResponseJob(resp, queue, proxyID, s.proxyPrinterURI(queue))
 	attrs := normLog.Attrs()
-	args := []any{"queue", queue, "user", user, "job_name", jobName, "document_format", format, "upstream_job_id", upstreamJobID, "proxy_job_id", proxyID, "copies", copies}
+	args := []any{"queue", queue, "user", user, "job_name", jobName, "document_format", format, "upstream_document_format", route.UpstreamFormat, "route_kind", map[bool]string{true: store.RouteURFToPWG, false: store.RoutePassThrough}[route.Transform], "upstream_job_id", upstreamJobID, "proxy_job_id", proxyID, "copies", copies}
 	for _, attr := range attrs {
 		args = append(args, attr.Key, attr.Value.Any())
 	}
@@ -1601,14 +1795,6 @@ func applyNormalizationResult(resp *goipp.Message, result NormalizationResult) {
 }
 
 func (s *Service) handleSendDocument(ctx context.Context, queue string, printer config.PrinterConfig, req *goipp.Message, payload io.Reader, hasPayload bool) (*goipp.Message, error) {
-	if hasPayload {
-		if protocolErr := validateExplicitDocumentFormat(req.Operation); protocolErr != nil {
-			return protocolResponse(req, protocolErr.Status, protocolErr.Message), nil
-		}
-		if protocolErr := s.validatePayloadDocumentFormat(queue, req); protocolErr != nil {
-			return protocolResponse(req, protocolErr.Status, protocolErr.Message), nil
-		}
-	}
 	proxyJobID := requestProxyJobID(req)
 	job, err := s.lookupRequestJob(ctx, queue, req)
 	if err != nil {
@@ -1616,6 +1802,26 @@ func (s *Service) handleSendDocument(ctx context.Context, queue string, printer 
 	}
 	if proxyJobID == 0 {
 		proxyJobID = job.ProxyJobID
+	}
+	defer s.statsStored(queue, proxyJobID)
+	if span := stats.SpanFromContext(ctx); span != nil {
+		span.SetJob(s.statisticsID, proxyJobID)
+		span.SetOwner(job.RequestingUser)
+	}
+	route, routeOK := routeFromStore(job)
+	requestedFormat, formatPresent := iattr.FirstString(req.Operation, "document-format")
+	if !routeOK {
+		fallbackFormat := requestedFormat
+		if strings.TrimSpace(fallbackFormat) == "" {
+			fallbackFormat = job.DocumentFormat
+		}
+		route, routeOK = s.routeForRequest(queue, fallbackFormat)
+	}
+	if !routeOK {
+		return protocolResponse(req, goipp.StatusErrorNotPossible, "job has no pinned document route"), nil
+	}
+	if formatPresent && !strings.EqualFold(strings.TrimSpace(requestedFormat), strings.TrimSpace(route.ClientFormat)) {
+		return protocolResponse(req, goipp.StatusErrorConflicting, "document-format conflicts with the route pinned at Create-Job"), nil
 	}
 	if !job.HasUpstreamJobID || job.UpstreamJobID < 1 || job.State == store.StateReserved || job.State == store.StateUncertain || store.IsTerminalState(job.State) {
 		return protocolResponse(req, goipp.StatusErrorNotPossible, "job is not available for document submission"), nil
@@ -1631,23 +1837,57 @@ func (s *Service) handleSendDocument(ctx context.Context, queue string, printer 
 		resp.Operation = responseOperationAttrs("this proxy accepts exactly one document per job")
 		return resp, nil
 	}
-	format, _ := iattr.FirstString(req.Operation, "document-format")
+	format := route.ClientFormat
 	if format == "" {
 		format = job.DocumentFormat
 	}
+	if hasPayload && format == "" {
+		return protocolResponse(req, goipp.StatusErrorDocumentFormatNotSupported, "job has no pinned document format"), nil
+	}
+	var translated *translatedDocument
+	if hasPayload && route.Transform {
+		translated, err = translatePayload(ctx, payload, route, nil, s.upstreamCapabilities(queue), s.cfg.Defaults.MaxDocumentBytes)
+		if err != nil {
+			s.recordTranslationError(queue, err)
+			s.logger.Warn("AirPrint document translation failed",
+				"queue", queue, "proxy_job_id", proxyJobID, "document_format", format,
+				"upstream_document_format", route.UpstreamFormat, "error", err)
+			protocolErr := translationErrorProtocol(req, err)
+			return protocolResponse(req, protocolErr.Status, protocolErr.Message), nil
+		}
+		defer func() {
+			if closeErr := translated.Close(); closeErr != nil {
+				s.logger.Warn("AirPrint translation staging cleanup failed", "queue", queue, "proxy_job_id", proxyJobID, "error", closeErr)
+			}
+		}()
+	}
 	req.Operation = rewriteMappedJobOperation(req.Operation, job)
+	req.Operation = rewriteDocumentFormat(req.Operation, route.UpstreamFormat)
 	req.Operation = rewriteOperationForUpstream(req.Operation, printer.UpstreamURI)
 	req.Groups = nil
 
-	recorder, err := newPayloadRecorder(payload)
-	if err != nil {
-		_ = s.store.MarkUncertain(ctx, queue, proxyJobID, err.Error())
-		return nil, err
+	var (
+		resp     *goipp.Message
+		meta     PayloadMetadata
+		metaErr  error
+		recorder *payloadRecorder
+	)
+	if translated != nil {
+		pages := int(translated.result.Pages)
+		impressions := pages * job.Copies
+		meta = PayloadMetadata{Bytes: translated.result.InputBytes, PageCount: &pages, Copies: job.Copies, EstimatedImpressions: &impressions}
+		resp, err = s.upstream.Do(ctx, printer.UpstreamURI, req, translated.Reader())
+	} else {
+		recorder, err = newPayloadRecorderContext(ctx, payload)
+		if err != nil {
+			_ = s.store.MarkUncertain(ctx, queue, proxyJobID, err.Error())
+			return nil, err
+		}
+		resp, err = s.upstream.Do(ctx, printer.UpstreamURI, req, recorder.Reader())
+		meta, metaErr = recorder.Finish(format, job.Copies)
 	}
-	resp, err := s.upstream.Do(ctx, printer.UpstreamURI, req, recorder.Reader())
 	persistCtx, cancelPersist := s.persistenceContext()
 	defer cancelPersist()
-	meta, metaErr := recorder.Finish(format, job.Copies)
 	if metaErr != nil {
 		s.logger.Warn("payload metadata extraction failed", "queue", queue, "proxy_job_id", proxyJobID, "error", metaErr)
 	}
@@ -1670,10 +1910,15 @@ func (s *Service) handleSendDocument(ctx context.Context, queue string, printer 
 			"proxy_job_id", proxyJobID,
 			"upstream_job_id", job.UpstreamJobID,
 			"document_format", format,
+			"upstream_document_format", route.UpstreamFormat,
+			"route_kind", routeKind(route),
 			"upstream_status", goipp.Status(resp.Code).String(),
 			"status_message", statusMessage(resp),
 			"payload_bytes", meta.Bytes,
 		)
+		if ippSuccess(resp) {
+			s.statsResponse(queue, proxyJobID, resp.Job, true, false)
+		}
 		rewriteResponseJob(resp, queue, proxyJobID, s.proxyPrinterURI(queue))
 		return resp, nil
 	}
@@ -1687,11 +1932,22 @@ func (s *Service) handleSendDocument(ctx context.Context, queue string, printer 
 			"proxy_job_id", proxyJobID,
 			"upstream_job_id", job.UpstreamJobID,
 			"document_format", format,
+			"upstream_document_format", route.UpstreamFormat,
+			"route_kind", routeKind(route),
 			"payload_bytes", meta.Bytes,
 			"page_count", nullableLogInt(meta.PageCount),
 			"copies", meta.Copies,
 			"estimated_impressions", nullableLogInt(meta.EstimatedImpressions),
 		)
+		if translated != nil {
+			s.logger.Info("AirPrint document translation completed",
+				"queue", queue, "proxy_job_id", proxyJobID, "translation_input_bytes", translated.result.InputBytes,
+				"translation_output_bytes", translated.result.OutputBytes, "translation_pages", translated.result.Pages,
+				"translation_duration_ms", translated.duration.Milliseconds())
+		}
+	}
+	if ippSuccess(resp) {
+		s.statsResponse(queue, proxyJobID, resp.Job, true, false)
 	}
 	rewriteResponseJob(resp, queue, proxyJobID, s.proxyPrinterURI(queue))
 	return resp, nil
@@ -1794,6 +2050,7 @@ func (s *Service) handleCancelMyJobs(ctx context.Context, queue string, printer 
 		if stateErr := s.store.MarkTerminal(persistCtx, queue, job.ProxyJobID, store.StateCanceled, ""); stateErr != nil {
 			s.logger.Warn("record canceled job state failed", "queue", queue, "proxy_job_id", job.ProxyJobID, "error", stateErr)
 		}
+		s.statsResponse(queue, job.ProxyJobID, cancelResp.Job, true, true)
 		cancelPersist()
 	}
 	if failed > 0 {
@@ -1871,6 +2128,11 @@ func (s *Service) handleMappedJobOperation(ctx context.Context, queue string, pr
 	if !job.HasUpstreamJobID || job.UpstreamJobID < 1 || job.State == store.StateReserved || job.State == store.StateUncertain {
 		return protocolResponse(req, goipp.StatusErrorNotPossible, "job mapping is not yet available"), nil
 	}
+	defer s.statsStored(queue, job.ProxyJobID)
+	if span := stats.SpanFromContext(ctx); span != nil {
+		span.SetJob(s.statisticsID, job.ProxyJobID)
+		span.SetOwner(job.RequestingUser)
+	}
 	op := goipp.Op(req.Code)
 	if store.IsTerminalState(job.State) && op != goipp.OpGetJobAttributes {
 		return protocolResponse(req, goipp.StatusErrorNotPossible, "job is already terminal"), nil
@@ -1897,7 +2159,7 @@ func (s *Service) handleMappedJobOperation(ctx context.Context, queue string, pr
 		rewriteResponseJob(resp, queue, job.ProxyJobID, s.proxyPrinterURI(queue))
 		return resp, nil
 	}
-	rewriteResponseJob(resp, queue, job.ProxyJobID, s.proxyPrinterURI(queue))
+	s.statsResponse(queue, job.ProxyJobID, resp.Job, true, op == goipp.OpCancelJob)
 	if op == goipp.OpCancelJob {
 		if stateErr := s.store.MarkTerminal(persistCtx, queue, job.ProxyJobID, store.StateCanceled, ""); stateErr != nil {
 			s.logger.Warn("record canceled job state failed", "queue", queue, "proxy_job_id", job.ProxyJobID, "error", stateErr)
@@ -1905,6 +2167,7 @@ func (s *Service) handleMappedJobOperation(ctx context.Context, queue string, pr
 	} else {
 		s.syncObservedJob(persistCtx, queue, job, resp.Job)
 	}
+	rewriteResponseJob(resp, queue, job.ProxyJobID, s.proxyPrinterURI(queue))
 	return resp, nil
 }
 
@@ -2206,6 +2469,7 @@ var jobTemplateAttributes = map[string]struct{}{
 }
 
 func (s *Service) syncObservedJob(ctx context.Context, queue string, job store.Job, attrs goipp.Attributes) {
+	s.statsResponse(queue, job.ProxyJobID, attrs, job.HasUpstreamJobID, false)
 	state, ok := iattr.FirstInt(attrs, "job-state")
 	if !ok {
 		return
@@ -2310,6 +2574,9 @@ func shapeIPPResponse(resp *goipp.Message) {
 }
 
 func writeIPP(w http.ResponseWriter, msg *goipp.Message) {
+	if recorder, ok := w.(interface{ recordIPP(*goipp.Message) }); ok {
+		recorder.recordIPP(msg)
+	}
 	w.Header().Set("content-type", goipp.ContentType)
 	w.Header().Set("cache-control", "no-cache")
 	w.WriteHeader(http.StatusOK)

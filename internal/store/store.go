@@ -70,6 +70,19 @@ var (
 	ErrInvalidArgument   = errors.New("invalid job registry argument")
 )
 
+// Route kinds describe how the client document is sent to the upstream
+// printer. Keep these values as strings in the registry so the store package
+// does not depend on the proxy or raster translator packages.
+const (
+	RoutePassThrough = "pass-through"
+	RouteURFToPWG    = "urf-to-pwg"
+
+	// RouteKind* aliases make the intent clearer at call sites that store the
+	// value in Job.RouteKind.
+	RouteKindPassThrough = RoutePassThrough
+	RouteKindURFToPWG    = RouteURFToPWG
+)
+
 // IsTerminalState reports whether state represents a terminal job. The
 // generic "terminal" value is supported for callers that do not have a more
 // specific IPP state.
@@ -95,15 +108,39 @@ type Store struct {
 type Job struct {
 	ProxyJobID int
 
-	UpstreamJobID        int
-	HasUpstreamJobID     bool
-	UpstreamJobURI       string
-	HasUpstreamJobURI    bool
-	Queue                string
-	QueueOwner           string
-	RequestingUser       string
-	JobName              string
-	DocumentFormat       string
+	UpstreamJobID     int
+	HasUpstreamJobID  bool
+	UpstreamJobURI    string
+	HasUpstreamJobURI bool
+	Queue             string
+	QueueOwner        string
+	RequestingUser    string
+	JobName           string
+	DocumentFormat    string
+	// UpstreamDocumentFormat is the format sent to the printer. It is kept
+	// separately from DocumentFormat because an AirPrint URF job may be
+	// translated to PWG Raster after the job has been created.
+	UpstreamDocumentFormat string
+	// RouteKind and RouteMapping identify the selected, immutable document
+	// path. Route settings below are the normalized values used by a translator
+	// and are intentionally stored with the job rather than re-derived from a
+	// later capability refresh.
+	RouteKind         string
+	RouteMapping      string
+	RouteMediaName    string
+	RouteMediaWidth   uint32
+	RouteMediaHeight  uint32
+	RouteMediaType    string
+	RouteMediaSource  uint32
+	RouteResolutionX  uint32
+	RouteResolutionY  uint32
+	RoutePrintQuality uint32
+	RouteSides        string
+	RouteSheetBack    string
+	// Route is a typed view of the flattened fields above. The database remains
+	// column-oriented for simple migrations and diagnostics; callers may use
+	// either representation.
+	Route                DocumentRoute
 	State                string
 	ObservedState        string
 	ObservedError        string
@@ -119,6 +156,108 @@ type Job struct {
 	ReconcileAt          *time.Time
 	LastReconcileAt      *time.Time
 	NextReconcileAt      *time.Time
+}
+
+// DocumentRoute is the durable routing decision made for one client
+// document. Media dimensions are hundredths of a millimetre, resolutions are
+// DPI, and MediaSource follows the PWG/URF numeric source representation.
+// ClientDocumentFormat is normally Job.DocumentFormat; it is included here
+// so an adapter can pass a complete route snapshot to UpdateRoute.
+type DocumentRoute struct {
+	ClientDocumentFormat   string
+	UpstreamDocumentFormat string
+	Kind                   string
+	Mapping                string
+	MediaName              string
+	MediaWidth             uint32
+	MediaHeight            uint32
+	MediaType              string
+	MediaSource            uint32
+	ResolutionX            uint32
+	ResolutionY            uint32
+	PrintQuality           uint32
+	Sides                  string
+	SheetBack              string
+}
+
+// Route is a short alias for callers that use the route terminology directly.
+type Route = DocumentRoute
+
+func routeFromJob(job Job) DocumentRoute {
+	route := job.Route
+	if route.ClientDocumentFormat == "" {
+		route.ClientDocumentFormat = job.DocumentFormat
+	}
+	if route.UpstreamDocumentFormat == "" {
+		route.UpstreamDocumentFormat = job.UpstreamDocumentFormat
+	}
+	if route.Kind == "" {
+		route.Kind = job.RouteKind
+	}
+	if route.Mapping == "" {
+		route.Mapping = job.RouteMapping
+	}
+	if route.MediaName == "" {
+		route.MediaName = job.RouteMediaName
+	}
+	if route.MediaWidth == 0 {
+		route.MediaWidth = job.RouteMediaWidth
+	}
+	if route.MediaHeight == 0 {
+		route.MediaHeight = job.RouteMediaHeight
+	}
+	if route.MediaType == "" {
+		route.MediaType = job.RouteMediaType
+	}
+	if route.MediaSource == 0 {
+		route.MediaSource = job.RouteMediaSource
+	}
+	if route.ResolutionX == 0 {
+		route.ResolutionX = job.RouteResolutionX
+	}
+	if route.ResolutionY == 0 {
+		route.ResolutionY = job.RouteResolutionY
+	}
+	if route.PrintQuality == 0 {
+		route.PrintQuality = job.RoutePrintQuality
+	}
+	if route.Sides == "" {
+		route.Sides = job.RouteSides
+	}
+	if route.SheetBack == "" {
+		route.SheetBack = job.RouteSheetBack
+	}
+	return route
+}
+
+func (job *Job) normalizeRoute() {
+	route := routeFromJob(*job)
+	if route.ClientDocumentFormat == "" {
+		route.ClientDocumentFormat = job.DocumentFormat
+	}
+	if job.DocumentFormat == "" {
+		job.DocumentFormat = route.ClientDocumentFormat
+	}
+	if route.UpstreamDocumentFormat == "" {
+		route.UpstreamDocumentFormat = job.DocumentFormat
+	}
+	if route.Kind == "" {
+		route.Kind = RoutePassThrough
+	}
+	job.UpstreamDocumentFormat = route.UpstreamDocumentFormat
+	job.RouteKind = route.Kind
+	job.RouteMapping = route.Mapping
+	job.RouteMediaName = route.MediaName
+	job.RouteMediaWidth = route.MediaWidth
+	job.RouteMediaHeight = route.MediaHeight
+	job.RouteMediaType = route.MediaType
+	job.RouteMediaSource = route.MediaSource
+	job.RouteResolutionX = route.ResolutionX
+	job.RouteResolutionY = route.ResolutionY
+	job.RoutePrintQuality = route.PrintQuality
+	job.RouteSides = route.Sides
+	job.RouteSheetBack = route.SheetBack
+	job.Route = route
 }
 
 // JobSummary contains aggregate registry state for diagnostics. It omits job
@@ -195,6 +334,19 @@ CREATE TABLE IF NOT EXISTS jobs (
 	requesting_user TEXT NOT NULL DEFAULT '',
 	job_name TEXT NOT NULL DEFAULT '',
 	document_format TEXT NOT NULL DEFAULT '',
+	upstream_document_format TEXT NOT NULL DEFAULT '',
+	route_kind TEXT NOT NULL DEFAULT '',
+	route_mapping TEXT NOT NULL DEFAULT '',
+	route_media_name TEXT NOT NULL DEFAULT '',
+	route_media_width INTEGER NOT NULL DEFAULT 0,
+	route_media_height INTEGER NOT NULL DEFAULT 0,
+	route_media_type TEXT NOT NULL DEFAULT '',
+	route_media_source INTEGER NOT NULL DEFAULT 0,
+	route_resolution_x INTEGER NOT NULL DEFAULT 0,
+	route_resolution_y INTEGER NOT NULL DEFAULT 0,
+	route_print_quality INTEGER NOT NULL DEFAULT 0,
+	route_sides TEXT NOT NULL DEFAULT '',
+	route_sheet_back TEXT NOT NULL DEFAULT '',
 	state TEXT NOT NULL DEFAULT '',
 	observed_state TEXT NOT NULL DEFAULT '',
 	observed_error TEXT NOT NULL DEFAULT '',
@@ -222,6 +374,19 @@ var modernJobColumns = []struct {
 	{"requesting_user", `ALTER TABLE jobs ADD COLUMN requesting_user TEXT NOT NULL DEFAULT ''`},
 	{"job_name", `ALTER TABLE jobs ADD COLUMN job_name TEXT NOT NULL DEFAULT ''`},
 	{"document_format", `ALTER TABLE jobs ADD COLUMN document_format TEXT NOT NULL DEFAULT ''`},
+	{"upstream_document_format", `ALTER TABLE jobs ADD COLUMN upstream_document_format TEXT NOT NULL DEFAULT ''`},
+	{"route_kind", `ALTER TABLE jobs ADD COLUMN route_kind TEXT NOT NULL DEFAULT ''`},
+	{"route_mapping", `ALTER TABLE jobs ADD COLUMN route_mapping TEXT NOT NULL DEFAULT ''`},
+	{"route_media_name", `ALTER TABLE jobs ADD COLUMN route_media_name TEXT NOT NULL DEFAULT ''`},
+	{"route_media_width", `ALTER TABLE jobs ADD COLUMN route_media_width INTEGER NOT NULL DEFAULT 0`},
+	{"route_media_height", `ALTER TABLE jobs ADD COLUMN route_media_height INTEGER NOT NULL DEFAULT 0`},
+	{"route_media_type", `ALTER TABLE jobs ADD COLUMN route_media_type TEXT NOT NULL DEFAULT ''`},
+	{"route_media_source", `ALTER TABLE jobs ADD COLUMN route_media_source INTEGER NOT NULL DEFAULT 0`},
+	{"route_resolution_x", `ALTER TABLE jobs ADD COLUMN route_resolution_x INTEGER NOT NULL DEFAULT 0`},
+	{"route_resolution_y", `ALTER TABLE jobs ADD COLUMN route_resolution_y INTEGER NOT NULL DEFAULT 0`},
+	{"route_print_quality", `ALTER TABLE jobs ADD COLUMN route_print_quality INTEGER NOT NULL DEFAULT 0`},
+	{"route_sides", `ALTER TABLE jobs ADD COLUMN route_sides TEXT NOT NULL DEFAULT ''`},
+	{"route_sheet_back", `ALTER TABLE jobs ADD COLUMN route_sheet_back TEXT NOT NULL DEFAULT ''`},
 	{"state", `ALTER TABLE jobs ADD COLUMN state TEXT NOT NULL DEFAULT ''`},
 	{"observed_state", `ALTER TABLE jobs ADD COLUMN observed_state TEXT NOT NULL DEFAULT ''`},
 	{"observed_error", `ALTER TABLE jobs ADD COLUMN observed_error TEXT NOT NULL DEFAULT ''`},
@@ -291,6 +456,15 @@ func (s *Store) migrate(ctx context.Context) error {
 	if _, err := tx.ExecContext(ctx, `UPDATE jobs SET terminal_at = COALESCE(terminal_at, updated_at, created_at) WHERE terminal_at IS NULL AND lower(state) IN ('terminal','completed','canceled','cancelled','aborted','failed','stopped')`); err != nil {
 		return fmt.Errorf("backfill terminal job timestamps: %w", err)
 	}
+	// Rows from pre-route versions only have the client document format. A
+	// legacy job was always pass-through, so retain that behavior explicitly
+	// while allowing new rows to pin a different upstream format.
+	if _, err := tx.ExecContext(ctx, `UPDATE jobs
+SET upstream_document_format = CASE WHEN NULLIF(upstream_document_format, '') IS NULL THEN document_format ELSE upstream_document_format END,
+    route_kind = CASE WHEN NULLIF(route_kind, '') IS NULL AND NULLIF(document_format, '') IS NOT NULL THEN ? ELSE route_kind END
+WHERE NULLIF(upstream_document_format, '') IS NULL OR (NULLIF(route_kind, '') IS NULL AND NULLIF(document_format, '') IS NOT NULL)`, RoutePassThrough); err != nil {
+		return fmt.Errorf("backfill legacy document routes: %w", err)
+	}
 
 	if _, err := tx.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_jobs_queue_state ON jobs(queue, state)`); err != nil {
 		return err
@@ -356,7 +530,10 @@ func notNull(columns map[string]tableColumn, name string) bool {
 
 var allJobColumnNames = []string{
 	"proxy_job_id", "upstream_job_id", "upstream_job_uri", "queue", "queue_owner",
-	"requesting_user", "job_name", "document_format", "state", "observed_state",
+	"requesting_user", "job_name", "document_format", "upstream_document_format", "route_kind",
+	"route_mapping", "route_media_name", "route_media_width", "route_media_height", "route_media_type",
+	"route_media_source", "route_resolution_x", "route_resolution_y", "route_print_quality", "route_sides",
+	"route_sheet_back", "state", "observed_state",
 	"observed_error", "payload_bytes", "page_count", "copies", "estimated_impressions",
 	"document_count", "last_document", "created_at", "updated_at", "terminal_at",
 	"reconcile_at", "last_reconcile_at", "next_reconcile_at",
@@ -394,6 +571,10 @@ func legacyColumnExpression(name string, columns map[string]tableColumn) string 
 			return `NULLIF(upstream_job_id, 0)`
 		case "upstream_job_uri":
 			return `NULLIF(upstream_job_uri, '')`
+		case "upstream_document_format":
+			return `COALESCE(NULLIF(upstream_document_format, ''), document_format)`
+		case "route_kind":
+			return `CASE WHEN NULLIF(route_kind, '') IS NOT NULL THEN route_kind WHEN NULLIF(document_format, '') IS NOT NULL THEN 'pass-through' ELSE '' END`
 		case "document_count":
 			return `COALESCE(document_count, 0)`
 		case "last_document":
@@ -407,9 +588,15 @@ func legacyColumnExpression(name string, columns map[string]tableColumn) string 
 		return `rowid`
 	case "upstream_job_id", "upstream_job_uri", "terminal_at", "reconcile_at", "last_reconcile_at", "next_reconcile_at":
 		return `NULL`
-	case "queue_owner", "requesting_user", "job_name", "document_format", "state", "observed_state", "observed_error":
+	case "queue_owner", "requesting_user", "job_name", "document_format", "upstream_document_format", "route_kind", "route_mapping", "route_media_name", "route_media_type", "route_sides", "route_sheet_back", "state", "observed_state", "observed_error":
+		if name == "upstream_document_format" && columns["document_format"].notNull {
+			return `document_format`
+		}
+		if name == "route_kind" && columns["document_format"].notNull {
+			return `CASE WHEN NULLIF(document_format, '') IS NOT NULL THEN 'pass-through' ELSE '' END`
+		}
 		return `''`
-	case "payload_bytes", "page_count", "estimated_impressions":
+	case "payload_bytes", "page_count", "estimated_impressions", "route_media_width", "route_media_height", "route_media_source", "route_resolution_x", "route_resolution_y", "route_print_quality":
 		return `0`
 	case "copies":
 		return `1`
@@ -431,6 +618,7 @@ func legacyColumnExpression(name string, columns map[string]tableColumn) string 
 // should reserve first and then mark the upstream mapping, but post-upstream
 // creation remains valid for existing callers and tests.
 func (s *Store) CreateJob(ctx context.Context, job Job) (int, error) {
+	job.normalizeRoute()
 	now := time.Now().UTC()
 	if job.CreatedAt.IsZero() {
 		job.CreatedAt = now
@@ -451,11 +639,16 @@ func (s *Store) CreateJob(ctx context.Context, job Job) (int, error) {
 	upstreamID := nullableUpstreamID(job)
 	upstreamURI := nullableUpstreamURI(job)
 	res, err := s.db.ExecContext(ctx, `
-INSERT INTO jobs (upstream_job_id, upstream_job_uri, queue, queue_owner, requesting_user, job_name, document_format, state,
+	INSERT INTO jobs (upstream_job_id, upstream_job_uri, queue, queue_owner, requesting_user, job_name, document_format,
+upstream_document_format, route_kind, route_mapping, route_media_name, route_media_width, route_media_height, route_media_type,
+route_media_source, route_resolution_x, route_resolution_y, route_print_quality, route_sides, route_sheet_back, state,
 observed_state, observed_error, payload_bytes, page_count, copies, estimated_impressions, document_count, last_document,
 created_at, updated_at, terminal_at, reconcile_at, last_reconcile_at, next_reconcile_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		upstreamID, upstreamURI, job.Queue, job.QueueOwner, job.RequestingUser, job.JobName, job.DocumentFormat, job.State,
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		upstreamID, upstreamURI, job.Queue, job.QueueOwner, job.RequestingUser, job.JobName, job.DocumentFormat,
+		job.UpstreamDocumentFormat, job.RouteKind, job.RouteMapping, job.RouteMediaName, job.RouteMediaWidth, job.RouteMediaHeight,
+		job.RouteMediaType, job.RouteMediaSource, job.RouteResolutionX, job.RouteResolutionY, job.RoutePrintQuality, job.RouteSides,
+		job.RouteSheetBack, job.State,
 		job.ObservedState, job.ObservedError, job.PayloadBytes, nullableInt(job.PageCount), job.Copies,
 		nullableInt(job.EstimatedImpressions), job.DocumentCount, boolInt(job.LastDocument), formatTime(job.CreatedAt),
 		formatTime(job.UpdatedAt), nullableTime(job.TerminalAt), nullableTime(job.ReconcileAt), nullableTime(job.LastReconcileAt),
@@ -520,6 +713,71 @@ func (s *Store) Lookup(ctx context.Context, args ...any) (Job, error) {
 	return s.GetByProxyID(ctx, args...)
 }
 
+// SelectedRoute returns the route snapshot stored with a job. It is a
+// convenience for adapters that only need the routing decision and should
+// not have to depend on the complete Job representation.
+func (s *Store) SelectedRoute(ctx context.Context, queue string, proxyID int) (DocumentRoute, error) {
+	job, err := s.GetByProxyID(ctx, queue, proxyID)
+	if err != nil {
+		return DocumentRoute{}, err
+	}
+	return routeFromJob(job), nil
+}
+
+// UpdateRoute pins a complete route snapshot to an existing job. The route
+// is intentionally a concrete value: adapters must select all mapping and
+// normalized page settings before persisting it. A terminal job cannot be
+// assigned a new route.
+func (s *Store) UpdateRoute(ctx context.Context, queue string, proxyID int, route DocumentRoute) error {
+	job := Job{DocumentFormat: route.ClientDocumentFormat, Route: route}
+	job.normalizeRoute()
+	route = routeFromJob(job)
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	stateQuery := `SELECT state FROM jobs WHERE proxy_job_id = ?`
+	stateArgs := []any{proxyID}
+	if queue != "" {
+		stateQuery += ` AND queue = ?`
+		stateArgs = append(stateArgs, queue)
+	}
+	var state string
+	if err := tx.QueryRowContext(ctx, stateQuery, stateArgs...).Scan(&state); err != nil {
+		return err
+	}
+	if IsTerminalState(state) {
+		return ErrInvalidTransition
+	}
+
+	query := `UPDATE jobs SET document_format = CASE WHEN ? <> '' THEN ? ELSE document_format END,
+upstream_document_format = ?, route_kind = ?, route_mapping = ?, route_media_name = ?, route_media_width = ?, route_media_height = ?,
+route_media_type = ?, route_media_source = ?, route_resolution_x = ?, route_resolution_y = ?, route_print_quality = ?, route_sides = ?,
+route_sheet_back = ?, updated_at = ? WHERE proxy_job_id = ?`
+	now := formatTime(time.Now().UTC())
+	queryArgs := []any{
+		route.ClientDocumentFormat, route.ClientDocumentFormat, route.UpstreamDocumentFormat, route.Kind, route.Mapping,
+		route.MediaName, route.MediaWidth, route.MediaHeight, route.MediaType, route.MediaSource, route.ResolutionX,
+		route.ResolutionY, route.PrintQuality, route.Sides, route.SheetBack, now, proxyID,
+	}
+	if queue != "" {
+		query += ` AND queue = ?`
+		queryArgs = append(queryArgs, queue)
+	}
+	result, err := tx.ExecContext(ctx, query, queryArgs...)
+	if err != nil {
+		return err
+	}
+	if affected, err := result.RowsAffected(); err != nil {
+		return err
+	} else if affected == 0 {
+		return sql.ErrNoRows
+	}
+	return tx.Commit()
+}
+
 // GetByUpstreamID accepts either (upstreamJobID) or (queue, upstreamJobID).
 func (s *Store) GetByUpstreamID(ctx context.Context, args ...any) (Job, error) {
 	queue, upstreamJobID, err := parseScopedID(args)
@@ -549,7 +807,9 @@ func (s *Store) GetByUpstreamURI(ctx context.Context, args ...any) (Job, error) 
 	return scanJob(s.db.QueryRowContext(ctx, query, queryArgs...))
 }
 
-const jobSelectColumns = `proxy_job_id, upstream_job_id, upstream_job_uri, queue, queue_owner, requesting_user, job_name, document_format, state,
+const jobSelectColumns = `proxy_job_id, upstream_job_id, upstream_job_uri, queue, queue_owner, requesting_user, job_name, document_format,
+upstream_document_format, route_kind, route_mapping, route_media_name, route_media_width, route_media_height, route_media_type,
+route_media_source, route_resolution_x, route_resolution_y, route_print_quality, route_sides, route_sheet_back, state,
 observed_state, observed_error, payload_bytes, page_count, copies, estimated_impressions, document_count, last_document,
 created_at, updated_at, terminal_at, reconcile_at, last_reconcile_at, next_reconcile_at`
 
@@ -562,11 +822,15 @@ func scanJob(row rowScanner) (Job, error) {
 	var upstreamID sql.NullInt64
 	var upstreamURI sql.NullString
 	var pageCount, impressions sql.NullInt64
+	var routeMediaWidth, routeMediaHeight, routeMediaSource sql.NullInt64
+	var routeResolutionX, routeResolutionY, routePrintQuality sql.NullInt64
 	var lastDocument int
 	var created, updated, terminal, reconcile, lastReconcile, nextReconcile sql.NullString
 	err := row.Scan(
 		&job.ProxyJobID, &upstreamID, &upstreamURI, &job.Queue, &job.QueueOwner, &job.RequestingUser, &job.JobName,
-		&job.DocumentFormat, &job.State, &job.ObservedState, &job.ObservedError, &job.PayloadBytes, &pageCount,
+		&job.DocumentFormat, &job.UpstreamDocumentFormat, &job.RouteKind, &job.RouteMapping, &job.RouteMediaName,
+		&routeMediaWidth, &routeMediaHeight, &job.RouteMediaType, &routeMediaSource, &routeResolutionX, &routeResolutionY,
+		&routePrintQuality, &job.RouteSides, &job.RouteSheetBack, &job.State, &job.ObservedState, &job.ObservedError, &job.PayloadBytes, &pageCount,
 		&job.Copies, &impressions, &job.DocumentCount, &lastDocument, &created, &updated, &terminal, &reconcile,
 		&lastReconcile, &nextReconcile)
 	if err != nil {
@@ -588,6 +852,24 @@ func scanJob(row rowScanner) (Job, error) {
 		value := int(impressions.Int64)
 		job.EstimatedImpressions = &value
 	}
+	if routeMediaWidth.Valid {
+		job.RouteMediaWidth = uint32(routeMediaWidth.Int64)
+	}
+	if routeMediaHeight.Valid {
+		job.RouteMediaHeight = uint32(routeMediaHeight.Int64)
+	}
+	if routeMediaSource.Valid {
+		job.RouteMediaSource = uint32(routeMediaSource.Int64)
+	}
+	if routeResolutionX.Valid {
+		job.RouteResolutionX = uint32(routeResolutionX.Int64)
+	}
+	if routeResolutionY.Valid {
+		job.RouteResolutionY = uint32(routeResolutionY.Int64)
+	}
+	if routePrintQuality.Valid {
+		job.RoutePrintQuality = uint32(routePrintQuality.Int64)
+	}
 	job.LastDocument = lastDocument != 0
 	job.CreatedAt = parseTime(created)
 	job.UpdatedAt = parseTime(updated)
@@ -595,6 +877,7 @@ func scanJob(row rowScanner) (Job, error) {
 	job.ReconcileAt = parseNullableTime(reconcile)
 	job.LastReconcileAt = parseNullableTime(lastReconcile)
 	job.NextReconcileAt = parseNullableTime(nextReconcile)
+	job.normalizeRoute()
 	return job, nil
 }
 

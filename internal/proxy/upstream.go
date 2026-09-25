@@ -14,9 +14,11 @@ import (
 
 	"github.com/OpenPrinting/goipp"
 	iattr "github.com/grimir/golieipp/internal/ipp"
+	"github.com/grimir/golieipp/internal/stats"
 )
 
 type UpstreamClient struct {
+	statistics       *stats.Collector
 	HTTP             *http.Client
 	MaxResponseBytes int64
 	ProbeTimeout     time.Duration
@@ -40,7 +42,22 @@ func NewUpstreamClient(logger *slog.Logger) *UpstreamClient {
 	}
 }
 
-func (c *UpstreamClient) Do(ctx context.Context, upstreamURI string, msg *goipp.Message, payload io.Reader) (*goipp.Message, error) {
+func (c *UpstreamClient) Do(ctx context.Context, upstreamURI string, msg *goipp.Message, payload io.Reader) (result *goipp.Message, retErr error) {
+	ctx, span := stats.Begin(ctx, c.statistics, stats.Action{Kind: "upstream-request", Operation: goipp.Op(msg.Code).String()})
+	defer func() {
+		outcome := outcomeForError(retErr)
+		if result != nil {
+			span.SetIPPStatus(int(result.Code))
+			if !ippSuccess(result) {
+				outcome = "rejected"
+			}
+		}
+		span.SetReason(statisticsReason(retErr))
+		span.Finish(outcome)
+	}()
+	if span != nil && payload != nil {
+		payload = &statisticsReader{Reader: payload, span: span, upstream: true}
+	}
 	start := time.Now()
 	op := goipp.Op(msg.Code)
 	safeUpstreamURI := redactDumpString(upstreamURI)
@@ -64,6 +81,9 @@ func (c *UpstreamClient) Do(ctx context.Context, upstreamURI string, msg *goipp.
 			"error", err,
 		)
 		return nil, err
+	}
+	if span != nil {
+		defer span.AcquireBuffer("upstream-ipp-envelope", int64(cap(envelope))).Release()
 	}
 	c.logger.Debug("upstream ipp request attributes",
 		"upstream_uri", safeUpstreamURI,
@@ -103,6 +123,7 @@ func (c *UpstreamClient) Do(ctx context.Context, upstreamURI string, msg *goipp.
 
 	resp, err := c.HTTP.Do(req)
 	if resp != nil {
+		span.SetHTTPStatus(resp.StatusCode)
 		defer resp.Body.Close()
 	}
 	if err != nil {

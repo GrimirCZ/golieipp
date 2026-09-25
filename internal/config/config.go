@@ -17,8 +17,9 @@ import (
 )
 
 type Config struct {
-	Listen  ListenConfig  `yaml:"listen"`
-	Storage StorageConfig `yaml:"storage"`
+	Listen     ListenConfig     `yaml:"listen"`
+	Storage    StorageConfig    `yaml:"storage"`
+	Statistics StatisticsConfig `yaml:"statistics"`
 	// Defaults contains process-wide resource limits. Limits is retained as a
 	// spelling-compatible alias for deployments that prefer that section name;
 	// after loading both fields contain the same effective values.
@@ -357,6 +358,7 @@ func (c *Config) applyDefaults() {
 	if c.Storage.SQLitePath == "" {
 		c.Storage.SQLitePath = "jobs.db"
 	}
+	c.Statistics.applyDefaults(c.Storage.SQLitePath)
 	for name, printer := range c.Printers {
 		if printer.DisplayName == "" {
 			printer.DisplayName = name
@@ -511,6 +513,9 @@ func (c *Config) Validate() error {
 	}
 	if err := validateDefaults(c.Defaults); err != nil {
 		return fmt.Errorf("defaults: %w", err)
+	}
+	if err := c.Statistics.validate(c.Storage.SQLitePath); err != nil {
+		return fmt.Errorf("statistics: %w", err)
 	}
 	if err := validateDNSSD(c.DNSSD); err != nil {
 		return fmt.Errorf("dns_sd: %w", err)
@@ -1120,6 +1125,11 @@ func configYAMLSchema() *yamlSchema {
 		}),
 		"storage": objectSchema(map[string]*yamlSchema{
 			"sqlite_path": keyword,
+		}),
+		"statistics": objectSchema(map[string]*yamlSchema{
+			"enabled": keyword, "sqlite_path": keyword, "detail_retention": keyword,
+			"cpu_retention": keyword, "rollup_retention": keyword, "queue_size": keyword,
+			"batch_size": keyword, "flush_interval": keyword, "resources": keyword, "cpu": keyword,
 		}),
 		"dns_sd": objectSchema(map[string]*yamlSchema{
 			"mode":            keyword,

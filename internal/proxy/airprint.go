@@ -11,6 +11,7 @@ import (
 
 	"github.com/OpenPrinting/goipp"
 	iattr "github.com/grimir/golieipp/internal/ipp"
+	"github.com/grimir/golieipp/internal/stats"
 	"github.com/grimir/golieipp/internal/store"
 	"github.com/grimir/golieipp/internal/urf"
 )
@@ -20,6 +21,7 @@ type translatedDocument struct {
 	path     string
 	result   urf.Result
 	duration time.Duration
+	resource *stats.Resource
 }
 
 func (d *translatedDocument) Reader() io.Reader {
@@ -33,6 +35,7 @@ func (d *translatedDocument) Close() error {
 	if d == nil {
 		return nil
 	}
+	defer d.resource.Release()
 	var joined error
 	if d.file != nil {
 		joined = errors.Join(joined, d.file.Close())
@@ -45,10 +48,12 @@ func (d *translatedDocument) Close() error {
 
 // translatePayload fully validates and stages an emulated document before an
 // upstream request is constructed. The caller owns cleanup through Close.
-func translatePayload(ctx context.Context, payload io.Reader, route DocumentRoute, attrs goipp.Attributes, upstream goipp.Attributes, maxBytes int64) (*translatedDocument, error) {
+func translatePayload(ctx context.Context, payload io.Reader, route DocumentRoute, attrs goipp.Attributes, upstream goipp.Attributes, maxBytes int64) (document *translatedDocument, retErr error) {
 	if !route.Transform {
 		return nil, nil
 	}
+	ctx, span := stats.BeginChild(ctx, stats.Action{Kind: "translation", Operation: "urf-to-pwg"})
+	defer func() { span.SetReason(statisticsReason(retErr)); span.Finish(outcomeForError(retErr)) }()
 	if payload == nil {
 		return nil, fmt.Errorf("emulated document payload is missing")
 	}
@@ -57,9 +62,20 @@ func translatePayload(ctx context.Context, payload io.Reader, route DocumentRout
 		return nil, fmt.Errorf("create AirPrint translation staging file: %w", err)
 	}
 	doc := &translatedDocument{file: file, path: file.Name()}
+	if span != nil {
+		doc.resource = span.AcquireTemp("urf/output", 0)
+	}
+	defer func() {
+		if info, err := file.Stat(); err == nil {
+			span.SetOutputBytes(info.Size())
+		}
+	}()
 	remove := true
 	defer func() {
 		if remove {
+			if info, err := file.Stat(); err == nil {
+				span.SetOutputBytes(info.Size())
+			}
 			_ = doc.Close()
 		}
 	}()
@@ -71,10 +87,15 @@ func translatePayload(ctx context.Context, payload io.Reader, route DocumentRout
 		limits.MaxOutputBytes = maxBytes
 	}
 	start := time.Now()
+	var observer urf.ResourceObserver
+	if span != nil {
+		observer = translationResources{span: span, output: doc.resource}
+	}
 	result, translateErr := urf.Translate(ctx, payload, file, urf.Options{
-		Mapping: route.Mapping,
-		Page:    settings,
-		Limits:  limits,
+		Mapping:  route.Mapping,
+		Page:     settings,
+		Limits:   limits,
+		Observer: observer,
 	})
 	if translateErr != nil {
 		return nil, translateErr
@@ -86,6 +107,7 @@ func translatePayload(ctx context.Context, payload io.Reader, route DocumentRout
 		return nil, fmt.Errorf("rewind AirPrint translation staging file: %w", err)
 	}
 	doc.result = result
+	span.SetOutputBytes(result.OutputBytes)
 	doc.duration = time.Since(start)
 	remove = false
 	return doc, nil

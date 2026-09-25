@@ -64,12 +64,18 @@ func Translate(ctx context.Context, src io.Reader, dst io.WriteSeeker, opts Opti
 	}
 
 	w := &translator{
-		ctx:     ctx,
-		src:     &sourceReader{ctx: ctx, r: src, limit: limits.MaxInputBytes},
-		dst:     dst,
-		mapping: opts.Mapping,
-		policy:  pagePolicy,
-		limits:  limits,
+		ctx:      ctx,
+		src:      &sourceReader{ctx: ctx, r: src, limit: limits.MaxInputBytes},
+		dst:      dst,
+		mapping:  opts.Mapping,
+		policy:   pagePolicy,
+		limits:   limits,
+		observer: opts.Observer,
+	}
+	defer w.releaseResources()
+	if w.observer != nil {
+		w.scratchLease = w.observer.AcquireBuffer("urf/compressed-scratch", maxCopyScratch)
+		w.outputLease = w.observer.AcquireTemp("urf/output", 0)
 	}
 
 	// The destination is private staging and must be empty.  io.WriteSeeker
@@ -257,12 +263,34 @@ type translator struct {
 	mapping Mapping
 	policy  pagePolicy
 
-	pages       uint32
-	pageCounts  []int64
-	outputBytes int64
-	outputSize  int64
-	pageLogical uint64
-	scratch     [maxCopyScratch]byte
+	pages        uint32
+	pageCounts   []int64
+	offsetLease  ResourceLease
+	outputBytes  int64
+	outputSize   int64
+	pageLogical  uint64
+	scratch      [maxCopyScratch]byte
+	observer     ResourceObserver
+	scratchLease ResourceLease
+	outputLease  ResourceLease
+}
+
+func (t *translator) releaseResources() {
+	if t == nil {
+		return
+	}
+	if t.offsetLease != nil {
+		t.offsetLease.Release()
+		t.offsetLease = nil
+	}
+	if t.outputLease != nil {
+		t.outputLease.Release()
+		t.outputLease = nil
+	}
+	if t.scratchLease != nil {
+		t.scratchLease.Release()
+		t.scratchLease = nil
+	}
 }
 
 func (t *translator) readFileHeader() error {
@@ -492,6 +520,15 @@ func mediaPixels(width, height, dpi uint32) (uint32, uint32, bool) {
 
 func (t *translator) emitPageHeader(p pageDescription) error {
 	h := make([]byte, pwgPageHeaderSize)
+	var headerLease ResourceLease
+	if t.observer != nil {
+		headerLease = t.observer.AcquireBuffer("urf/page-header", int64(pwgPageHeaderSize))
+		defer func() {
+			if headerLease != nil {
+				headerLease.Release()
+			}
+		}()
+	}
 	copyString(h[0:64], "PwgRaster")
 	copyString(h[128:192], t.policy.mediaType)
 	copyString(h[1732:1796], t.policy.mediaName)
@@ -555,7 +592,17 @@ func (t *translator) emitPageHeader(p pageDescription) error {
 	if err := t.write(h, t.pages+1, 0); err != nil {
 		return err
 	}
+	previousCapacity := cap(t.pageCounts)
 	t.pageCounts = append(t.pageCounts, countOffset)
+	if cap(t.pageCounts) != previousCapacity {
+		if t.offsetLease != nil {
+			t.offsetLease.Release()
+			t.offsetLease = nil
+		}
+		if t.observer != nil {
+			t.offsetLease = t.observer.AcquireBuffer("urf/page-offsets", int64(cap(t.pageCounts))*8)
+		}
+	}
 	return nil
 }
 
@@ -728,6 +775,10 @@ func (t *translator) write(buf []byte, page, row uint32) error {
 			return wrapError(KindDestinationIO, "write destination", errors.New("invalid write count"), t.src.count, page, row)
 		}
 		t.outputBytes += int64(n)
+		if t.outputLease != nil {
+			t.outputLease.Written(int64(n))
+			t.outputLease.SetSize(t.outputBytes)
+		}
 		if err != nil {
 			return wrapError(KindDestinationIO, "write destination", err, t.src.count, page, row)
 		}
@@ -815,6 +866,9 @@ func (t *translator) seekWrite(off int64, buf []byte, op string) error {
 		}
 		if err != nil {
 			return wrapError(KindDestinationIO, op, err, t.src.count, t.pages, 0)
+		}
+		if t.outputLease != nil {
+			t.outputLease.Written(int64(n))
 		}
 		if n == 0 {
 			return wrapError(KindDestinationIO, op, io.ErrShortWrite, t.src.count, t.pages, 0)

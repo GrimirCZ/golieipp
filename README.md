@@ -62,6 +62,42 @@ the proxy so clients receive new proxy-owned configuration-change metadata.
 
 Start from `config.example.yaml`.
 
+## Usage statistics
+
+Statistics are recorded by default in a separate SQLite database named
+`<storage.sqlite_path>.stats.sqlite`. Disable collection with
+`statistics.enabled: false`. Recording failures never block printing.
+
+```sh
+golieipp stats summary --config config.yaml --group day
+golieipp stats users --db jobs.db.stats.sqlite --format csv
+golieipp stats jobs --db jobs.db.stats.sqlite --user alice --limit 100
+golieipp stats actions --db jobs.db.stats.sqlite --queue office-a4-bw
+golieipp stats resources --db jobs.db.stats.sqlite --format json
+```
+
+Reports default to the last 30 UTC days. `--since` is inclusive and `--until`
+is exclusive; both accept UTC dates or RFC3339 timestamps. Usernames are exact,
+client-supplied names, not authenticated identities; `--user ''` selects unknown
+users. Table/CSV coverage information is printed to stderr, while JSON includes
+it as metadata. Reports open SQLite read-only and do not contact printers.
+
+Collection measures actions, payload bytes, explicit buffer capacities, temporary
+file sizes, and aggregate process CPU at action boundaries. There is no periodic
+resource sampler. Tracked buffer capacity is not total heap or resident memory,
+and CPU is not attributed to individual jobs or users. Estimates and unknown
+output counts remain distinct from printer-reported impressions and sheets.
+
+Detailed history defaults to 90 days, CPU observations to 30 days, and daily
+rollups are retained indefinitely. These limits, recording queue limits, and
+resource/CPU collection switches are configurable in `config.example.yaml`.
+Existing jobs are not backfilled. The recording queue is bounded and may lose
+records on overflow, storage failure, or abrupt termination; reports and
+`SIGUSR1` diagnostics expose known recording gaps.
+
+See [statistics reference](docs/statistics.md) for measurement semantics and
+manual SQL queries.
+
 ## Install with systemd
 
 Build the Linux binary:
@@ -237,6 +273,23 @@ group. Profile subtype changes rebuild the entry group because they are
 structural registrations. The public listener is plaintext-only, so the proxy
 does not publish `_ipps._tcp` records; ordinary `_ipp._tcp` remains available
 when AirPrint or IPP Everywhere is ineligible.
+
+The route bridge is intentionally an opt-in compatibility feature. To roll it
+back, change a queue from `emulate-if-missing` to `auto` (or `disabled`),
+restart the proxy, and confirm that ordinary IPP and IPP Everywhere remain
+available. Existing jobs already created with an emulated route retain their
+durable route until they finish; new jobs follow the updated mode.
+
+Use [the AirPrint qualification checklist](docs/airprint-emulation/06-qualify-airprint-emulation.md)
+before enabling emulation on a Canon queue. The repository contains automated
+translator, proxy acceptance, failure, diagnostics, and store tests, but it
+does not claim Linux runtime/daemon or physical Canon, iOS, or macOS
+qualification. The Avahi-tagged suite passes on macOS and a static Linux
+`amd64` build succeeds; the proxy acceptance suite exercises the SRGB24 and
+DEVRGB-only color routes, unsupported color-space rejection, monochrome
+filtering, emulated `Validate-Job`, JPEG pass-through, and transformed
+upstream rejection state. Physical Canon, iOS, and macOS qualification remain
+open.
 
 ## Implemented IPP operations
 

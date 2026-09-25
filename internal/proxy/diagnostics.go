@@ -48,6 +48,7 @@ type diagnosticSnapshot struct {
 	JobSummary        store.JobSummary
 	JobSummaryError   string
 	JobStoreAvailable bool
+	Statistics        any
 }
 
 type diagnosticQueue struct {
@@ -65,6 +66,7 @@ type diagnosticQueue struct {
 	UpstreamCapabilities goipp.Attributes
 	ClientCapabilities   goipp.Attributes
 	Profiles             CapabilityProfiles
+	Routes               RouteSnapshot
 	Publisher            dnssd.Publisher
 }
 
@@ -104,6 +106,7 @@ func (applicationDiagnosticPlugin) Dump(_ context.Context, snapshot diagnosticSn
 		jobState["error"] = snapshot.JobSummaryError
 	}
 	sections = append(sections, diagnosticSection{Name: "job_registry", Value: jobState})
+	sections = append(sections, diagnosticSection{Name: "statistics", Value: snapshot.Statistics})
 
 	for _, queue := range snapshot.Queues {
 		health := queue.Health
@@ -125,6 +128,11 @@ func (applicationDiagnosticPlugin) Dump(_ context.Context, snapshot diagnosticSn
 			"last_error":              diagnosticError(health.LastError, queue.Printer.UpstreamURI),
 			"ipp_everywhere_eligible": health.IPPEligible,
 			"profiles":                diagnosticProfiles(queue.Profiles),
+			"airprint_path":           queue.Routes.AirPrintPath,
+			"airprint_reason":         queue.Routes.Reason,
+			"synthesized_urf":         append([]string(nil), queue.Routes.URFTokens...),
+			"document_routes":         diagnosticRoutes(queue.Routes.Routes),
+			"last_translation_error":  diagnosticError(health.LastTranslationError, queue.Printer.UpstreamURI),
 			"profile_warnings":        health.ProfileWarnings,
 			"payload_jobs_in_flight":  queue.PayloadJobsInFlight,
 			"payload_job_capacity":    queue.PayloadJobCapacity,
@@ -204,6 +212,7 @@ func (s *Service) captureDiagnosticSnapshot() diagnosticSnapshot {
 		StartedAt:       s.startedAt,
 		NextRequestID:   s.nextID.Load(),
 		EffectiveConfig: effectiveConfigDump(s.cfg),
+		Statistics:      s.statistics.Health(),
 	}
 	if s.upstream != nil {
 		snapshot.ProbeTimeout = s.upstream.ProbeTimeout
@@ -236,15 +245,21 @@ func (s *Service) captureDiagnosticSnapshot() diagnosticSnapshot {
 			payloadJobCapacity = cap(slot)
 		}
 		queueSnapshot := diagnosticQueue{
-			Name:                queue,
-			Printer:             printer,
-			PublicURI:           s.proxyPrinterURI(queue),
-			Active:              active,
-			Stale:               active && !health.LastSuccess.IsZero() && now.Sub(health.LastSuccess) > 2*interval,
-			RefreshInFlight:     s.refreshing[queue],
-			ConfigChangedAt:     s.configChangedAt[queue],
-			Health:              health,
-			Profiles:            profiles,
+			Name:            queue,
+			Printer:         printer,
+			PublicURI:       s.proxyPrinterURI(queue),
+			Active:          active,
+			Stale:           active && !health.LastSuccess.IsZero() && now.Sub(health.LastSuccess) > 2*interval,
+			RefreshInFlight: s.refreshing[queue],
+			ConfigChangedAt: s.configChangedAt[queue],
+			Health:          health,
+			Profiles:        profiles,
+			Routes: func() RouteSnapshot {
+				if model, ok := s.capabilityModels[queue]; ok {
+					return model.Routes.clone()
+				}
+				return buildRouteSnapshot(s.capabilities[queue], printer.Policy, printer)
+			}(),
 			PayloadJobsInFlight: payloadJobsInFlight,
 			PayloadJobCapacity:  payloadJobCapacity,
 			DNSRetrying:         s.dnsRetrying[queue],
@@ -308,7 +323,8 @@ func effectiveConfigDump(cfg *config.Config) map[string]any {
 		"storage": map[string]any{
 			"sqlite_path": cfg.Storage.SQLitePath,
 		},
-		"defaults": defaultsConfigDump(cfg.Defaults),
+		"defaults":   defaultsConfigDump(cfg.Defaults),
+		"statistics": map[string]any{"enabled": cfg.Statistics.Enabled, "sqlite_path": cfg.Statistics.SQLitePath, "detail_retention": cfg.Statistics.DetailRetention, "cpu_retention": cfg.Statistics.CPURetention, "rollup_retention": cfg.Statistics.RollupRetention, "queue_size": cfg.Statistics.QueueSize, "batch_size": cfg.Statistics.BatchSize, "flush_interval": cfg.Statistics.FlushInterval, "resources": cfg.Statistics.Resources, "cpu": cfg.Statistics.CPU},
 		"dns_sd": map[string]any{
 			"mode":            cfg.DNSSD.Mode,
 			"hostname":        cfg.DNSSD.Hostname,
@@ -373,6 +389,25 @@ func diagnosticProfile(profile CapabilityProfile) map[string]any {
 		"reason":   profile.Reason,
 		"warnings": append([]string(nil), profile.Warnings...),
 	}
+}
+
+func diagnosticRoutes(routes []DocumentRoute) []map[string]any {
+	result := make([]map[string]any, 0, len(routes))
+	for _, route := range routes {
+		entry := map[string]any{
+			"client_format":   route.ClientFormat,
+			"upstream_format": route.UpstreamFormat,
+			"transform":       route.Transform,
+			"mapping":         route.Mapping.String(),
+			"media":           route.Page.MediaName,
+			"resolution_x":    route.Page.ResolutionX,
+			"resolution_y":    route.Page.ResolutionY,
+			"sides":           route.Page.Sides,
+			"sheet_back":      route.Page.SheetBack,
+		}
+		result = append(result, entry)
+	}
+	return result
 }
 
 func diagnosticError(message, upstreamURI string) string {
