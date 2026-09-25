@@ -6,7 +6,8 @@ GOARCH ?= amd64
 CGO_ENABLED ?= 0
 TAGS ?=
 
-GO_TAG_ARGS := $(if $(strip $(TAGS)),-tags $(TAGS),)
+# Keep this recursive so target-specific TAGS values are visible to prerequisites.
+GO_TAG_ARGS = $(if $(strip $(TAGS)),-tags $(TAGS),)
 
 .PHONY: build linux-x86 clean test
 
